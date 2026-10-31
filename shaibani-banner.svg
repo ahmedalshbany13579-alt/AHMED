@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+  <title id="title">ترويسة محلات الشيباني</title>
+  <desc id="desc">ترويسة خضراء وذهبية لمحلات الشيباني للبهارات والأعشاب الطبيعية</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b342b"/>
+      <stop offset="0.55" stop-color="#145344"/>
+      <stop offset="1" stop-color="#092b24"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9b7027"/>
+      <stop offset="0.5" stop-color="#f0d48b"/>
+      <stop offset="1" stop-color="#a77b32"/>
+    </linearGradient>
+    <pattern id="pattern" width="54" height="54" patternUnits="userSpaceOnUse">
+      <path d="M27 4 50 27 27 50 4 27Z" fill="none" stroke="#f0d48b" stroke-opacity=".075" stroke-width="1.5"/>
+      <circle cx="27" cy="27" r="4" fill="#f0d48b" fill-opacity=".08"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="240" rx="20" fill="url(#bg)"/>
+  <rect width="1200" height="240" rx="20" fill="url(#pattern)"/>
+  <rect x="18" y="18" width="1164" height="204" rx="13" fill="none" stroke="url(#gold)" stroke-width="3"/>
+  <path d="M52 120h220M928 120h220" stroke="url(#gold)" stroke-width="2" opacity=".8"/>
+  <path d="M62 120l18-18 18 18-18 18Z M1102 120l18-18 18 18-18 18Z" fill="none" stroke="#e8c77d" stroke-width="2"/>
+  <g fill="#f0dcae" text-anchor="middle" direction="rtl">
+    <text x="600" y="104" font-family="Tahoma, Arial, sans-serif" font-size="52" font-weight="700">محلات الشيباني</text>
+    <text x="600" y="158" font-family="Tahoma, Arial, sans-serif" font-size="27" font-weight="600" fill="#e8c77d">للبهارات والأعشاب الطبيعية</text>
+  </g>
+  <path d="M430 184h340" stroke="url(#gold)" stroke-width="2"/>
+  <circle cx="600" cy="184" r="5" fill="#f0d48b"/>
+</svg>

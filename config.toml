@@ -1,0 +1,4 @@
+project_id = "shaibani-erp"
+
+[functions.admin-invite]
+verify_jwt = true

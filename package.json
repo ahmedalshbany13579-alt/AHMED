@@ -1,0 +1,13 @@
+{
+  "name": "shaibani-erp-web",
+  "version": "2.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Static PWA for Shaibani accounting and inventory ERP",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node scripts/validate-project.mjs"
+  }
+}

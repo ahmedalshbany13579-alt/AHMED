@@ -1,0 +1,779 @@
+-- REFERENCE ONLY - DO NOT EXECUTE ON THE EXISTING AL-SHAIBANI PROJECT.
+-- This baseline targets the public schema and was authored for a fresh, separate project.
+-- The current ERP database is already isolated in shaibani_erp. Running this file may
+-- collide with the legacy store's public objects. Keep this file for reference only.
+
+-- نظام الشيباني المحاسبي: schema baseline
+-- نفّذ هذا الملف مرة واحدة من Supabase SQL Editor أو عبر Supabase CLI.
+create extension if not exists pgcrypto;
+create schema if not exists private;
+
+-- ملفات المستخدمين والأدوار: المستخدم الجديد يبدأ غير مفعّل حتى يراجعه المدير.
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text not null default '',
+  role text not null default 'cashier' check (role in ('manager','accountant','cashier')),
+  is_active boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.touch_updated_at()
+returns trigger language plpgsql set search_path=pg_catalog,public,pg_temp as $$
+begin new.updated_at := now(); return new; end $$;
+drop trigger if exists profiles_touch_updated_at on public.profiles;
+create trigger profiles_touch_updated_at before update on public.profiles
+for each row execute function public.touch_updated_at();
+
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
+begin
+  insert into public.profiles(id,full_name,role,is_active)
+  values(new.id,coalesce(new.raw_user_meta_data->>'full_name',''), 'cashier', false)
+  on conflict(id) do nothing;
+  return new;
+end $$;
+drop trigger if exists on_auth_user_created_shaibani on auth.users;
+create trigger on_auth_user_created_shaibani after insert on auth.users
+for each row execute function public.handle_new_user();
+
+create or replace function public.current_app_role()
+returns text language sql stable security definer set search_path=pg_catalog,public,pg_temp as $$
+  select p.role from public.profiles p
+  where p.id=(select auth.uid()) and p.is_active=true
+  limit 1
+$$;
+create or replace function public.is_active_user()
+returns boolean language sql stable security definer set search_path=pg_catalog,public,pg_temp as $$
+  select exists(select 1 from public.profiles p where p.id=(select auth.uid()) and p.is_active=true)
+$$;
+revoke all on function public.current_app_role() from public, anon;
+revoke all on function public.is_active_user() from public, anon;
+grant execute on function public.current_app_role() to authenticated;
+grant execute on function public.is_active_user() to authenticated;
+
+create table if not exists public.currencies (
+  code text primary key check (code in ('YER','SAR','USD')),
+  name text not null,
+  symbol text not null,
+  decimal_places smallint not null default 2 check(decimal_places between 0 and 4),
+  active boolean not null default true
+);
+create table if not exists public.settings (
+  id smallint primary key default 1 check(id=1),
+  store_name text not null default 'محلات الشيباني للبهارات والأعشاب الطبيعية',
+  base_currency text not null default 'YER' references public.currencies(code),
+  tax_rate numeric(8,4) not null default 0 check(tax_rate>=0),
+  updated_at timestamptz not null default now()
+);
+create table if not exists public.exchange_rates (
+  id bigint generated always as identity primary key,
+  from_currency text not null references public.currencies(code),
+  to_currency text not null references public.currencies(code),
+  rate numeric(20,8) not null check(rate>0),
+  effective_date date not null default current_date,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  unique(from_currency,to_currency,effective_date)
+);
+
+create table if not exists public.accounts (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,
+  name text not null,
+  account_type text not null check(account_type in ('asset','liability','equity','revenue','expense')),
+  normal_side text not null check(normal_side in ('debit','credit')),
+  parent_id uuid references public.accounts(id),
+  is_system boolean not null default false,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create table if not exists public.cash_accounts (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  currency text not null references public.currencies(code),
+  account_id uuid not null references public.accounts(id),
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  unique(currency,name)
+);
+
+create table if not exists public.parties (
+  id uuid primary key default gen_random_uuid(),
+  party_type text not null check(party_type in ('customer','supplier','both')),
+  name text not null,
+  phone text,
+  address text,
+  opening_balance numeric(20,4) not null default 0,
+  opening_balance_side text not null default 'none' check(opening_balance_side in ('none','receivable','payable')),
+  opening_currency text not null default 'YER' references public.currencies(code),
+  notes text,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists parties_name_idx on public.parties using gin (to_tsvector('simple',name));
+drop trigger if exists parties_touch_updated_at on public.parties;
+create trigger parties_touch_updated_at before update on public.parties
+for each row execute function public.touch_updated_at();
+
+create table if not exists public.products (
+  id uuid primary key default gen_random_uuid(),
+  sku text unique,
+  name text not null,
+  category text,
+  base_unit text not null default 'كيلو',
+  avg_cost_base numeric(20,6) not null default 0 check(avg_cost_base>=0),
+  reorder_level numeric(20,4) not null default 0 check(reorder_level>=0),
+  description text,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists products_name_idx on public.products using gin (to_tsvector('simple',name));
+drop trigger if exists products_touch_updated_at on public.products;
+create trigger products_touch_updated_at before update on public.products
+for each row execute function public.touch_updated_at();
+
+create table if not exists public.product_units (
+  id uuid primary key default gen_random_uuid(),
+  product_id uuid not null references public.products(id) on delete cascade,
+  unit_name text not null,
+  factor_to_base numeric(20,8) not null check(factor_to_base>0),
+  purchase_price numeric(20,4) not null default 0 check(purchase_price>=0),
+  sale_price numeric(20,4) not null default 0 check(sale_price>=0),
+  currency text not null default 'YER' references public.currencies(code),
+  is_base boolean not null default false,
+  active boolean not null default true,
+  unique(product_id,unit_name)
+);
+create unique index if not exists product_one_base_unit on public.product_units(product_id) where is_base=true;
+
+create table if not exists public.product_catalog_events (
+  id bigint generated always as identity primary key,
+  product_id uuid not null,
+  event_type text not null default 'changed' check(event_type in ('created','changed')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+create index if not exists product_catalog_events_created_idx on public.product_catalog_events(created_at desc);
+
+create table if not exists public.warehouses (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  is_default boolean not null default false,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists one_default_warehouse on public.warehouses(is_default) where is_default=true;
+
+create table if not exists public.documents (
+  id uuid primary key default gen_random_uuid(),
+  doc_no text not null unique,
+  doc_type text not null check(doc_type in ('sale','purchase','expense','receipt','payment')),
+  party_id uuid references public.parties(id),
+  document_date date not null default current_date,
+  currency text not null references public.currencies(code),
+  exchange_rate numeric(20,8) not null check(exchange_rate>0),
+  settlement_method text not null default 'cash' check(settlement_method in ('cash','credit')),
+  cash_account_id uuid references public.cash_accounts(id),
+  expense_account_id uuid references public.accounts(id),
+  subtotal numeric(20,4) not null default 0 check(subtotal>=0),
+  discount numeric(20,4) not null default 0 check(discount>=0),
+  tax numeric(20,4) not null default 0 check(tax>=0),
+  total numeric(20,4) not null check(total>=0),
+  notes text,
+  status text not null default 'posted' check(status in ('posted','void')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  posted_at timestamptz not null default now()
+);
+create index if not exists documents_date_type_idx on public.documents(document_date,doc_type);
+create index if not exists documents_party_idx on public.documents(party_id);
+
+create table if not exists public.document_lines (
+  id uuid primary key default gen_random_uuid(),
+  document_id uuid not null references public.documents(id) on delete cascade,
+  product_id uuid not null references public.products(id),
+  product_name text not null,
+  unit_id uuid not null references public.product_units(id),
+  unit_name text not null,
+  quantity numeric(20,4) not null check(quantity>0),
+  factor_to_base numeric(20,8) not null check(factor_to_base>0),
+  quantity_base numeric(20,6) not null check(quantity_base>0),
+  unit_price numeric(20,4) not null check(unit_price>=0),
+  line_total numeric(20,4) not null check(line_total>=0)
+);
+create index if not exists document_lines_document_idx on public.document_lines(document_id);
+
+create table if not exists public.stock_movements (
+  id uuid primary key default gen_random_uuid(),
+  product_id uuid not null references public.products(id),
+  warehouse_id uuid not null references public.warehouses(id),
+  document_id uuid references public.documents(id),
+  movement_type text not null check(movement_type in ('purchase','sale','adjustment_in','adjustment_out')),
+  quantity_in numeric(20,6) not null default 0 check(quantity_in>=0),
+  quantity_out numeric(20,6) not null default 0 check(quantity_out>=0),
+  unit_cost_base numeric(20,6) not null default 0 check(unit_cost_base>=0),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  check(not(quantity_in>0 and quantity_out>0))
+);
+create index if not exists stock_movements_product_idx on public.stock_movements(product_id,warehouse_id);
+
+create table if not exists public.journal_entries (
+  id uuid primary key default gen_random_uuid(),
+  entry_no text not null unique,
+  entry_date date not null default current_date,
+  description text not null,
+  document_id uuid references public.documents(id),
+  posted boolean not null default true,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+create table if not exists public.journal_lines (
+  id uuid primary key default gen_random_uuid(),
+  entry_id uuid not null references public.journal_entries(id) on delete cascade,
+  account_id uuid not null references public.accounts(id),
+  debit_base numeric(20,4) not null default 0 check(debit_base>=0),
+  credit_base numeric(20,4) not null default 0 check(credit_base>=0),
+  currency text references public.currencies(code),
+  foreign_amount numeric(20,4) not null default 0 check(foreign_amount>=0),
+  party_id uuid references public.parties(id),
+  memo text,
+  check(not(debit_base>0 and credit_base>0))
+);
+create index if not exists journal_lines_account_idx on public.journal_lines(account_id);
+
+-- لا تسمح بتغيير بيانات الرصيد الافتتاحي بعد إنشاء قيده المحاسبي.
+create or replace function public.prevent_opening_party_edit_after_posting()
+returns trigger language plpgsql set search_path=pg_catalog,public,pg_temp as $$
+begin
+  if (old.opening_balance,old.opening_balance_side,old.opening_currency)
+     is distinct from (new.opening_balance,new.opening_balance_side,new.opening_currency)
+     and exists(select 1 from public.journal_lines where party_id=old.id) then
+    raise exception 'لا يمكن تعديل بيانات الرصيد الافتتاحي بعد ترحيل حركات الطرف؛ استخدم قيد تسوية معتمد';
+  end if;
+  return new;
+end $$;
+drop trigger if exists parties_opening_balance_guard on public.parties;
+create trigger parties_opening_balance_guard before update on public.parties
+for each row execute function public.prevent_opening_party_edit_after_posting();
+
+-- تكلفة المتوسط لا تُعدّل يدوياً بعد حركة المخزون؛ التحديثات الآلية تمر من إجراء الترحيل.
+create or replace function public.prevent_manual_avg_cost_change()
+returns trigger language plpgsql set search_path=pg_catalog,public,pg_temp as $$
+begin
+  if exists(select 1 from public.stock_movements where product_id=old.id) then
+    if new.base_unit is distinct from old.base_unit then
+      raise exception 'لا يمكن تغيير الوحدة الأساسية بعد وجود حركة مخزون؛ حافظ على تعريف الوحدة للصنف';
+    end if;
+    if new.avg_cost_base is distinct from old.avg_cost_base
+       and coalesce(current_setting('shaibani.allow_cost_recalc',true),'off')<>'on' then
+      raise exception 'لا يمكن تغيير متوسط التكلفة بعد وجود حركة مخزون؛ استخدم مستند تسوية تكلفة معتمد';
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists products_avg_cost_guard on public.products;
+create trigger products_avg_cost_guard before update of avg_cost_base,base_unit on public.products
+for each row execute function public.prevent_manual_avg_cost_change();
+
+-- بيانات تأسيس محايدة: لا تُضاف أي أصناف أو أسعار أو أرصدة تجارية تلقائياً.
+insert into public.currencies(code,name,symbol,decimal_places) values
+ ('YER','ريال يمني','ر.ي',0),('SAR','ريال سعودي','ر.س',2),('USD','دولار أمريكي','$',2)
+on conflict(code) do nothing;
+insert into public.settings(id,store_name,base_currency) values(1,'محلات الشيباني للبهارات والأعشاب الطبيعية','YER') on conflict(id) do nothing;
+create or replace function public.prevent_base_currency_change() returns trigger language plpgsql set search_path=pg_catalog,public,pg_temp as $$ begin if old.base_currency is distinct from new.base_currency and exists(select 1 from public.journal_entries where posted=true) then raise exception 'لا يمكن تغيير العملة الأساسية بعد ترحيل أي قيد؛ عالج ذلك بقيود تحويل معتمدة'; end if; new.updated_at:=now(); return new; end $$;
+drop trigger if exists settings_base_currency_guard on public.settings;
+create trigger settings_base_currency_guard before update on public.settings for each row execute function public.prevent_base_currency_change();
+insert into public.accounts(code,name,account_type,normal_side,is_system) values
+ ('1010','الصندوق - ريال يمني','asset','debit',true),
+ ('1020','الصندوق - ريال سعودي','asset','debit',true),
+ ('1030','الصندوق - دولار','asset','debit',true),
+ ('1100','العملاء / الذمم المدينة','asset','debit',true),
+ ('1200','المخزون','asset','debit',true),
+ ('2000','الموردون / الذمم الدائنة','liability','credit',true),
+ ('2100','ضريبة مستحقة','liability','credit',true),
+ ('3000','رأس المال','equity','credit',true),
+ ('4000','إيرادات المبيعات','revenue','credit',true),
+ ('5000','تكلفة البضاعة المباعة','expense','debit',true),
+ ('5100','المصروفات التشغيلية','expense','debit',true)
+on conflict(code) do nothing;
+insert into public.cash_accounts(name,currency,account_id)
+select v.name,v.currency,a.id from (values
+ ('الصندوق الرئيسي - يمني','YER','1010'),('الصندوق الرئيسي - سعودي','SAR','1020'),('الصندوق الرئيسي - دولار','USD','1030')
+) as v(name,currency,code) join public.accounts a on a.code=v.code
+on conflict(currency,name) do nothing;
+insert into public.warehouses(name,is_default) values('المستودع الرئيسي',true) on conflict(name) do nothing;
+
+-- أرصدة افتتاحية للجهات والصندوق والمخزون؛ كل رصيد يمر عبر قيد متوازن محمي.
+create or replace function public.set_opening_party_balance(p_party_id uuid,p_amount numeric,p_currency text)
+returns uuid language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
+declare v_uid uuid:=auth.uid(); v_role text; v_party public.parties%rowtype; v_base text; v_fx numeric(20,8); v_ar uuid; v_ap uuid; v_equity uuid; v_entry uuid; v_no text; v_base_amount numeric(20,4);
+begin
+  select role into v_role from public.profiles where id=v_uid and is_active=true;
+  if v_role is null or v_role not in ('manager','accountant') then raise exception 'لا تملك صلاحية إدخال الأرصدة الافتتاحية'; end if;
+  if p_amount is null or p_amount<=0 then raise exception 'أدخل رصيداً أكبر من صفر'; end if;
+  select * into v_party from public.parties where id=p_party_id and active for update;
+  if not found then raise exception 'العميل أو المورد غير موجود'; end if;
+  if v_party.opening_balance_side='none' then raise exception 'حدد طبيعة الرصيد الافتتاحي'; end if;
+  if exists(select 1 from public.journal_lines where party_id=p_party_id) then raise exception 'للطرف حركات محاسبية سابقة؛ لا يمكن إضافة قيد افتتاحي تلقائي'; end if;
+  select base_currency into v_base from public.settings where id=1;
+  if p_currency=v_base then v_fx:=1; else
+    select rate into v_fx from public.exchange_rates where from_currency=p_currency and to_currency=v_base and effective_date<=current_date order by effective_date desc limit 1;
+    if v_fx is null then raise exception 'سجّل سعر صرف % مقابل % أولاً',p_currency,v_base; end if;
+  end if;
+  select id into v_ar from public.accounts where code='1100';
+  select id into v_ap from public.accounts where code='2000';
+  select id into v_equity from public.accounts where code='3000';
+  v_base_amount:=round(p_amount*v_fx,4);
+  v_no:='OPEN-PARTY-'||substr(replace(gen_random_uuid()::text,'-',''),1,12);
+  insert into public.journal_entries(entry_no,entry_date,description,created_by) values(v_no,current_date,'قيد افتتاحي للطرف: '||v_party.name,v_uid) returning id into v_entry;
+  if v_party.opening_balance_side='receivable' then
+    if v_party.party_type not in ('customer','both') then raise exception 'طبيعة الرصيد لا تتوافق مع نوع الطرف'; end if;
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo) values(v_entry,v_ar,v_base_amount,p_currency,p_amount,p_party_id,'رصيد عميل افتتاحي');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo) values(v_entry,v_equity,v_base_amount,p_currency,p_amount,p_party_id,'مقابل أرصدة افتتاحية');
+  else
+    if v_party.party_type not in ('supplier','both') then raise exception 'طبيعة الرصيد لا تتوافق مع نوع الطرف'; end if;
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo) values(v_entry,v_equity,v_base_amount,p_currency,p_amount,p_party_id,'مقابل أرصدة افتتاحية');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo) values(v_entry,v_ap,v_base_amount,p_currency,p_amount,p_party_id,'رصيد مورد افتتاحي');
+  end if;
+  return v_entry;
+end $$;
+
+create or replace function public.set_opening_cash_balance(p_cash_account_id uuid,p_amount numeric)
+returns uuid language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
+declare v_uid uuid:=auth.uid(); v_role text; v_cash public.cash_accounts%rowtype; v_base text; v_fx numeric(20,8); v_equity uuid; v_entry uuid; v_no text;
+begin
+  select role into v_role from public.profiles where id=v_uid and is_active=true;
+  if v_role is null or v_role not in ('manager','accountant') then raise exception 'لا تملك صلاحية إدخال رصيد افتتاحي للصندوق'; end if;
+  if p_amount is null or p_amount<=0 then raise exception 'أدخل مبلغاً أكبر من صفر'; end if;
+  select * into v_cash from public.cash_accounts where id=p_cash_account_id and active for update;
+  if not found then raise exception 'الصندوق غير موجود'; end if;
+  if exists(select 1 from public.journal_lines where account_id=v_cash.account_id) then raise exception 'يوجد رصيد أو حركة سابقة لهذا الصندوق'; end if;
+  select base_currency into v_base from public.settings where id=1;
+  if v_cash.currency=v_base then v_fx:=1; else
+    select rate into v_fx from public.exchange_rates where from_currency=v_cash.currency and to_currency=v_base and effective_date<=current_date order by effective_date desc limit 1;
+    if v_fx is null then raise exception 'سجّل سعر صرف % مقابل % أولاً',v_cash.currency,v_base; end if;
+  end if;
+  select id into v_equity from public.accounts where code='3000';
+  v_no:='OPEN-CASH-'||substr(replace(gen_random_uuid()::text,'-',''),1,12);
+  insert into public.journal_entries(entry_no,entry_date,description,created_by) values(v_no,current_date,'رصيد افتتاحي للصندوق: '||v_cash.name,v_uid) returning id into v_entry;
+  insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,memo) values(v_entry,v_cash.account_id,round(p_amount*v_fx,4),v_cash.currency,p_amount,'رصيد صندوق افتتاحي');
+  insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,memo) values(v_entry,v_equity,round(p_amount*v_fx,4),v_cash.currency,p_amount,'مقابل رصيد افتتاحي');
+  return v_entry;
+end $$;
+
+create or replace function public.set_opening_stock(p_product_id uuid,p_quantity_base numeric,p_unit_cost_base numeric)
+returns uuid language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
+declare v_uid uuid:=auth.uid(); v_role text; v_warehouse uuid; v_inventory uuid; v_equity uuid; v_product public.products%rowtype; v_entry uuid; v_no text; v_value numeric(20,4);
+begin
+  select role into v_role from public.profiles where id=v_uid and is_active=true;
+  if v_role is null or v_role not in ('manager','accountant') then raise exception 'لا تملك صلاحية إدخال رصيد مخزون افتتاحي'; end if;
+  if p_quantity_base is null or p_quantity_base<=0 or p_unit_cost_base is null or p_unit_cost_base<=0 then raise exception 'أدخل كمية وتكلفة افتتاحية أكبر من صفر'; end if;
+  select * into v_product from public.products where id=p_product_id and active for update;
+  if not found then raise exception 'الصنف غير موجود'; end if;
+  if exists(select 1 from public.stock_movements where product_id=p_product_id) then raise exception 'للصنف حركات مخزون سابقة؛ لا يمكن إضافة رصيد افتتاحي'; end if;
+  select id into v_warehouse from public.warehouses where is_default=true and active limit 1;
+  select id into v_inventory from public.accounts where code='1200';
+  select id into v_equity from public.accounts where code='3000';
+  v_value:=round(p_quantity_base*p_unit_cost_base,4);
+  v_no:='OPEN-STOCK-'||substr(replace(gen_random_uuid()::text,'-',''),1,12);
+  perform set_config('shaibani.allow_cost_recalc','on',true);
+  update public.products set avg_cost_base=p_unit_cost_base where id=p_product_id;
+  perform set_config('shaibani.allow_cost_recalc','off',true);
+  insert into public.stock_movements(product_id,warehouse_id,movement_type,quantity_in,unit_cost_base,created_by)
+  values(p_product_id,v_warehouse,'adjustment_in',p_quantity_base,p_unit_cost_base,v_uid);
+  insert into public.journal_entries(entry_no,entry_date,description,created_by) values(v_no,current_date,'رصيد مخزون افتتاحي: '||v_product.name,v_uid) returning id into v_entry;
+  insert into public.journal_lines(entry_id,account_id,debit_base,memo) values(v_entry,v_inventory,v_value,'قيمة المخزون الافتتاحي');
+  insert into public.journal_lines(entry_id,account_id,credit_base,memo) values(v_entry,v_equity,v_value,'مقابل رصيد المخزون الافتتاحي');
+  return v_entry;
+end $$;
+revoke all on function public.set_opening_party_balance(uuid,numeric,text) from public,anon;
+revoke all on function public.set_opening_cash_balance(uuid,numeric) from public,anon;
+revoke all on function public.set_opening_stock(uuid,numeric,numeric) from public,anon;
+grant execute on function public.set_opening_party_balance(uuid,numeric,text) to authenticated;
+grant execute on function public.set_opening_cash_balance(uuid,numeric) to authenticated;
+grant execute on function public.set_opening_stock(uuid,numeric,numeric) to authenticated;
+
+-- كتالوج بصلاحيات أعمدة: الكاشير لا يتلقى تكلفة الشراء أو متوسط التكلفة.
+create or replace view public.v_products with (security_invoker=false) as
+select p.id,p.sku,p.name,p.category,p.base_unit,
+       case when public.current_app_role() in ('manager','accountant') then p.avg_cost_base else null::numeric(20,6) end as avg_cost_base,
+       p.reorder_level,p.description,p.active,p.created_at,p.updated_at
+from public.products p where public.is_active_user() and p.active;
+create or replace view public.v_product_units with (security_invoker=false) as
+select u.id,u.product_id,u.unit_name,u.factor_to_base,
+       case when public.current_app_role() in ('manager','accountant') then u.purchase_price else null::numeric(20,4) end as purchase_price,
+       u.sale_price,u.currency,u.is_base,u.active
+from public.product_units u join public.products p on p.id=u.product_id
+where public.is_active_user() and p.active and u.active;
+revoke all on public.v_products,public.v_product_units from public,anon;
+grant select on public.v_products,public.v_product_units to authenticated;
+
+-- الكتابة على كتالوج الأصناف تمر عبر RPC محمية بدلاً من منح وصول مباشر إلى أعمدة التكلفة.
+create or replace function public.save_product(p_payload jsonb)
+returns uuid language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
+declare
+  v_uid uuid:=auth.uid(); v_role text; v_id uuid; v_base_id uuid;
+  v_name text; v_sku text; v_category text; v_base_unit text; v_currency text;
+  v_buy numeric(20,4); v_sell numeric(20,4); v_avg numeric(20,6); v_reorder numeric(20,4); v_desc text;
+  v_unit jsonb; v_unit_name text; v_factor numeric(20,8); v_keep text[];
+begin
+  select role into v_role from public.profiles where id=v_uid and is_active=true;
+  if v_role is null or v_role not in ('manager','accountant') then raise exception 'لا تملك صلاحية إدارة الأصناف'; end if;
+  v_name:=nullif(trim(p_payload->>'name'),'');
+  v_sku:=nullif(trim(p_payload->>'sku'),'');
+  v_category:=nullif(trim(p_payload->>'category'),'');
+  v_base_unit:=nullif(trim(p_payload->>'base_unit'),'');
+  v_currency:=coalesce(p_payload->>'currency','YER');
+  v_buy:=coalesce(nullif(p_payload->>'purchase_price','')::numeric,0);
+  v_sell:=coalesce(nullif(p_payload->>'sale_price','')::numeric,0);
+  v_avg:=coalesce(nullif(p_payload->>'avg_cost_base','')::numeric,0);
+  v_reorder:=coalesce(nullif(p_payload->>'reorder_level','')::numeric,0);
+  v_desc:=nullif(p_payload->>'description','');
+  if v_name is null or v_base_unit is null then raise exception 'اسم الصنف والوحدة الأساسية مطلوبان'; end if;
+  if v_currency not in ('YER','SAR','USD') or v_buy<0 or v_sell<0 or v_avg<0 or v_reorder<0 then raise exception 'تحقق من العملة والأسعار والتكلفة وحد إعادة الطلب'; end if;
+  if jsonb_typeof(coalesce(p_payload->'units','[]'::jsonb))<>'array' then raise exception 'صيغة الوحدات الإضافية غير صحيحة'; end if;
+  if nullif(p_payload->>'id','') is null then
+    insert into public.products(sku,name,category,base_unit,avg_cost_base,reorder_level,description)
+    values(v_sku,v_name,v_category,v_base_unit,v_avg,v_reorder,v_desc) returning id into v_id;
+  else
+    v_id:=(p_payload->>'id')::uuid;
+    update public.products set sku=v_sku,name=v_name,category=v_category,base_unit=v_base_unit,
+      avg_cost_base=v_avg,reorder_level=v_reorder,description=v_desc where id=v_id and active;
+    if not found then raise exception 'الصنف غير موجود أو غير فعال'; end if;
+  end if;
+  if exists(select 1 from public.product_units where product_id=v_id and unit_name=v_base_unit and is_base=false) then
+    raise exception 'اسم الوحدة الأساسية مستخدم كوحدة إضافية؛ غيّر اسم الوحدة الإضافية أولاً';
+  end if;
+  select id into v_base_id from public.product_units where product_id=v_id and is_base=true for update;
+  if v_base_id is null then
+    insert into public.product_units(product_id,unit_name,factor_to_base,purchase_price,sale_price,currency,is_base,active)
+    values(v_id,v_base_unit,1,v_buy,v_sell,v_currency,true,true);
+  else
+    update public.product_units set unit_name=v_base_unit,factor_to_base=1,purchase_price=v_buy,sale_price=v_sell,currency=v_currency,active=true
+    where id=v_base_id;
+  end if;
+  v_keep:=array[v_base_unit];
+  for v_unit in select value from jsonb_array_elements(coalesce(p_payload->'units','[]'::jsonb)) loop
+    v_unit_name:=nullif(trim(v_unit->>'unit_name'),'');
+    v_factor:=nullif(v_unit->>'factor_to_base','')::numeric;
+    if v_unit_name is null or v_unit_name=v_base_unit or v_factor is null or v_factor<=0 then
+      raise exception 'تحقق من اسم الوحدة الإضافية وعامل التحويل';
+    end if;
+    if v_unit_name=any(v_keep) then raise exception 'اسم الوحدة مكرر: %',v_unit_name; end if;
+    v_keep:=array_append(v_keep,v_unit_name);
+    insert into public.product_units(product_id,unit_name,factor_to_base,purchase_price,sale_price,currency,is_base,active)
+    values(v_id,v_unit_name,v_factor,round(v_buy*v_factor,4),round(v_sell*v_factor,4),v_currency,false,true)
+    on conflict(product_id,unit_name) do update set factor_to_base=excluded.factor_to_base,
+      purchase_price=excluded.purchase_price,sale_price=excluded.sale_price,currency=excluded.currency,is_base=false,active=true;
+  end loop;
+  update public.product_units set active=false where product_id=v_id and is_base=false and not(unit_name=any(v_keep));
+  insert into public.product_catalog_events(product_id,event_type,created_by)
+  values(v_id,case when nullif(p_payload->>'id','') is null then 'created' else 'changed' end,v_uid);
+  return v_id;
+end $$;
+revoke all on function public.save_product(jsonb) from public,anon;
+grant execute on function public.save_product(jsonb) to authenticated;
+
+-- تُسحب صلاحيات الجداول الأساسية بعد منح الصلاحيات العامة داخل كتلة السياسات أدناه؛ الوصول عبر views وRPC فقط.
+
+
+-- Policies: لا توجد صلاحيات للمستخدم المجهول. RLS يعمل على كل جدول مكشوف.
+do $$ declare t text; begin
+  foreach t in array array['profiles','currencies','settings','exchange_rates','accounts','cash_accounts','parties','products','product_units','product_catalog_events','warehouses','documents','document_lines','stock_movements','journal_entries','journal_lines'] loop
+    execute format('alter table public.%I enable row level security',t);
+    execute format('revoke all on table public.%I from anon',t);
+    execute format('grant select,insert,update,delete on table public.%I to authenticated',t);
+  end loop;
+end $$;
+
+revoke all on public.products,public.product_units from authenticated;
+revoke insert,update,delete on public.product_catalog_events from authenticated;
+
+create policy profiles_read_self_or_manager on public.profiles for select to authenticated
+using(id=(select auth.uid()) or public.current_app_role()='manager');
+create policy profiles_update_manager on public.profiles for update to authenticated
+using(public.current_app_role()='manager') with check(public.current_app_role()='manager');
+
+create policy currencies_read_active on public.currencies for select to authenticated using(public.is_active_user());
+create policy currencies_manage_manager on public.currencies for all to authenticated
+using(public.current_app_role()='manager') with check(public.current_app_role()='manager');
+create policy settings_read_active on public.settings for select to authenticated using(public.is_active_user());
+create policy settings_manage_manager on public.settings for update to authenticated
+using(public.current_app_role()='manager') with check(public.current_app_role()='manager');
+create policy exchange_rates_read_active on public.exchange_rates for select to authenticated using(public.is_active_user());
+create policy exchange_rates_manage on public.exchange_rates for all to authenticated
+using(public.current_app_role() in ('manager','accountant')) with check(public.current_app_role() in ('manager','accountant'));
+create policy accounts_read_finance on public.accounts for select to authenticated
+using(public.current_app_role() in ('manager','accountant'));
+create policy accounts_manage_manager on public.accounts for all to authenticated
+using(public.current_app_role()='manager') with check(public.current_app_role()='manager');
+create policy cash_accounts_read_active on public.cash_accounts for select to authenticated using(public.is_active_user());
+create policy cash_accounts_manage on public.cash_accounts for all to authenticated
+using(public.current_app_role() in ('manager','accountant')) with check(public.current_app_role() in ('manager','accountant'));
+drop policy if exists parties_read_active on public.parties;
+create policy parties_read_active on public.parties for select to authenticated
+using(public.is_active_user() and (public.current_app_role() in ('manager','accountant') or party_type in ('customer','both')));
+create policy parties_manage on public.parties for all to authenticated
+using(public.current_app_role() in ('manager','accountant')) with check(public.current_app_role() in ('manager','accountant'));
+create policy products_read_active on public.products for select to authenticated using(public.is_active_user());
+create policy products_manage on public.products for all to authenticated
+using(public.current_app_role() in ('manager','accountant')) with check(public.current_app_role() in ('manager','accountant'));
+create policy product_units_read_active on public.product_units for select to authenticated using(public.is_active_user());
+create policy product_units_manage on public.product_units for all to authenticated
+using(public.current_app_role() in ('manager','accountant')) with check(public.current_app_role() in ('manager','accountant'));
+create policy warehouses_read_active on public.warehouses for select to authenticated using(public.is_active_user());
+create policy warehouses_manage on public.warehouses for all to authenticated
+using(public.current_app_role()='manager') with check(public.current_app_role()='manager');
+drop policy if exists documents_read_active on public.documents;
+create policy documents_read_active on public.documents for select to authenticated
+using(public.is_active_user() and (public.current_app_role() in ('manager','accountant') or doc_type='sale'));
+create policy stock_read_active on public.stock_movements for select to authenticated
+using(public.is_active_user() and public.current_app_role() in ('manager','accountant'));
+drop policy if exists document_lines_read_active on public.document_lines;
+create policy document_lines_read_active on public.document_lines for select to authenticated
+using(public.is_active_user() and exists(select 1 from public.documents d where d.id=document_id and (public.current_app_role() in ('manager','accountant') or d.doc_type='sale')));
+create policy product_catalog_events_read on public.product_catalog_events for select to authenticated using(public.is_active_user());
+create policy journals_read_finance on public.journal_entries for select to authenticated
+using(public.current_app_role() in ('manager','accountant'));
+create policy journal_lines_read_finance on public.journal_lines for select to authenticated
+using(public.current_app_role() in ('manager','accountant'));
+-- لا تُمنح صلاحية إدخال مستندات أو قيود مباشرة؛ الترحيل يمر عبر RPC محمي وذرّي.
+revoke insert,update,delete on public.documents,public.document_lines,public.stock_movements,public.journal_entries,public.journal_lines from authenticated;
+
+-- إجراء ترحيل واحد ينشئ المستند وحركة المخزون والقيد المزدوج داخل transaction واحدة.
+create or replace function public.post_document(p_payload jsonb)
+returns uuid
+language plpgsql
+security definer
+set search_path=pg_catalog,public,pg_temp
+as $$
+declare
+  v_uid uuid := auth.uid(); v_role text; v_type text; v_currency text; v_fx numeric(20,8);
+  v_date date; v_party uuid; v_method text; v_cash_id uuid; v_cash_account uuid; v_base_currency text; v_db_fx numeric(20,8);
+  v_expense_account uuid; v_warehouse uuid; v_subtotal numeric(20,4):=0;
+  v_discount numeric(20,4):=0; v_tax numeric(20,4):=0; v_total numeric(20,4):=0;
+  v_doc uuid; v_doc_no text; v_entry uuid; v_entry_no text;
+  v_line jsonb; v_product uuid; v_unit uuid; v_unit_name text; v_product_name text; v_factor numeric(20,8);
+  v_qty numeric(20,4); v_qty_base numeric(20,6); v_price numeric(20,4); v_line_total numeric(20,4);
+  v_available numeric(20,6); v_old_qty numeric(20,6); v_avg_cost numeric(20,6); v_cost numeric(20,4):=0;
+  v_base_total numeric(20,4); v_revenue numeric(20,4); v_tax_base numeric(20,4);
+  v_debit_account uuid; v_credit_account uuid; v_revenue_account uuid; v_inventory_account uuid;
+  v_cogs_account uuid; v_tax_account uuid; v_ap_account uuid; v_ar_account uuid;
+  v_lines_count integer:=0; v_amount numeric(20,4);
+begin
+  if v_uid is null then raise exception 'يجب تسجيل الدخول أولاً'; end if;
+  select role into v_role from public.profiles where id=v_uid and is_active=true;
+  if v_role is null then raise exception 'الحساب غير مفعّل؛ راجع مدير النظام'; end if;
+  v_type := p_payload->>'doc_type';
+  if v_type is null or v_type not in ('sale','purchase','expense','receipt','payment') then raise exception 'نوع المستند غير مدعوم'; end if;
+  if v_role='cashier' and v_type<>'sale' then raise exception 'صلاحية الكاشير تسمح بفواتير البيع فقط'; end if;
+  v_currency := coalesce(p_payload->>'currency','YER');
+  if not exists(select 1 from public.currencies where code=v_currency and active) then raise exception 'العملة غير مفعّلة'; end if;
+  v_fx := coalesce(nullif(p_payload->>'exchange_rate','')::numeric,1);
+  if v_fx<=0 then raise exception 'سعر الصرف يجب أن يكون أكبر من صفر'; end if;
+  v_date := coalesce(nullif(p_payload->>'document_date','')::date,current_date);
+  select base_currency into v_base_currency from public.settings where id=1;
+  if v_base_currency is null then raise exception 'حدد العملة الأساسية في الإعدادات'; end if;
+  if v_currency=v_base_currency and abs(v_fx-1)>0.00000001 then raise exception 'سعر صرف العملة الأساسية يجب أن يساوي 1'; end if;
+  if v_currency<>v_base_currency then
+    select er.rate into v_db_fx from public.exchange_rates er where er.from_currency=v_currency and er.to_currency=v_base_currency and er.effective_date<=v_date order by er.effective_date desc limit 1;
+    if v_db_fx is null then raise exception 'سجّل سعر صرف % مقابل % أولاً',v_currency,v_base_currency; end if;
+    if abs(v_fx-v_db_fx)>0.00000001 then raise exception 'سعر الصرف لا يطابق السعر المعتمد بتاريخ المستند (%). أعد تحميل السعر من الإعدادات',v_db_fx; end if;
+  end if;
+  v_party := nullif(p_payload->>'party_id','')::uuid;
+  v_method := coalesce(p_payload->>'settlement_method','cash');
+  if v_method not in ('cash','credit') then raise exception 'طريقة السداد غير صحيحة'; end if;
+  if (v_type in ('purchase','receipt','payment') or (v_type='sale' and v_method='credit') or (v_type='expense' and v_method='credit')) and v_party is null then raise exception 'اختر العميل أو المورد'; end if;
+  if v_type='purchase' and not exists(select 1 from public.parties where id=v_party and party_type in ('supplier','both') and active) then raise exception 'الطرف المحدد ليس مورداً فعالاً'; end if;
+  if v_type='expense' and v_method='credit' and not exists(select 1 from public.parties where id=v_party and party_type in ('supplier','both') and active) then raise exception 'حدد مورداً فعالاً للمصروف الآجل'; end if;
+  if v_type in ('sale','receipt') and v_party is not null and not exists(select 1 from public.parties where id=v_party and party_type in ('customer','both') and active) then raise exception 'الطرف المحدد ليس عميلاً فعالاً'; end if;
+  if v_type='payment' and not exists(select 1 from public.parties where id=v_party and party_type in ('supplier','both') and active) then raise exception 'اختر مورداً فعالاً للسداد'; end if;
+  v_cash_id := nullif(p_payload->>'cash_account_id','')::uuid;
+  if v_method='cash' or v_type in ('receipt','payment') then
+    if v_cash_id is null then raise exception 'اختر الصندوق'; end if;
+    select ca.account_id into v_cash_account from public.cash_accounts ca
+      where ca.id=v_cash_id and ca.currency=v_currency and ca.active;
+    if v_cash_account is null then raise exception 'الصندوق غير موجود أو عملته لا تطابق عملة المستند'; end if;
+  end if;
+  v_expense_account := nullif(p_payload->>'expense_account_id','')::uuid;
+  if v_type='expense' then
+    if v_role='cashier' then raise exception 'لا تملك صلاحية تسجيل المصروفات'; end if;
+    if v_expense_account is null or not exists(select 1 from public.accounts where id=v_expense_account and account_type='expense' and active) then
+      select id into v_expense_account from public.accounts where code='5100';
+    end if;
+  end if;
+  select id into v_ar_account from public.accounts where code='1100';
+  select id into v_ap_account from public.accounts where code='2000';
+  select id into v_inventory_account from public.accounts where code='1200';
+  select id into v_revenue_account from public.accounts where code='4000';
+  select id into v_cogs_account from public.accounts where code='5000';
+  select id into v_tax_account from public.accounts where code='2100';
+  select id into v_warehouse from public.warehouses where is_default=true and active limit 1;
+  if v_type in ('sale','purchase') and v_warehouse is null then raise exception 'أنشئ مستودعاً افتراضياً أولاً'; end if;
+
+  if v_type in ('sale','purchase') then
+    if jsonb_typeof(p_payload->'lines')<>'array' then raise exception 'أضف بنداً واحداً على الأقل'; end if;
+    for v_line in select value from jsonb_array_elements(p_payload->'lines') loop
+      v_product := (v_line->>'product_id')::uuid; v_unit := (v_line->>'unit_id')::uuid;
+      v_qty := (v_line->>'quantity')::numeric; v_price := (v_line->>'unit_price')::numeric;
+      if v_qty is null or v_price is null or v_qty<=0 or v_price<=0 then raise exception 'تحقق من الكمية والسعر؛ يجب أن يكون السعر أكبر من صفر'; end if;
+      select pu.unit_name,pu.factor_to_base into v_unit_name,v_factor
+      from public.product_units pu join public.products pr on pr.id=pu.product_id
+      where pu.id=v_unit and pu.product_id=v_product and pu.active and pr.active;
+      if v_factor is null then raise exception 'وحدة الصنف غير صالحة'; end if;
+      v_line_total := round(v_qty*v_price,4); v_subtotal := v_subtotal+v_line_total; v_lines_count:=v_lines_count+1;
+    end loop;
+    if v_lines_count=0 then raise exception 'أضف بنداً واحداً على الأقل'; end if;
+  else
+    v_subtotal := coalesce(nullif(p_payload->>'amount','')::numeric,0);
+    if v_subtotal<=0 then raise exception 'أدخل مبلغاً أكبر من صفر'; end if;
+  end if;
+  v_discount := coalesce(nullif(p_payload->>'discount','')::numeric,0);
+  v_tax := coalesce(nullif(p_payload->>'tax','')::numeric,0);
+  if v_discount<0 or v_tax<0 or v_discount>v_subtotal then raise exception 'تحقق من الخصم والضريبة'; end if;
+  if v_type<>'sale' and (v_discount<>0 or v_tax<>0) then raise exception 'الخصم والضريبة مفعّلان حالياً في فواتير البيع فقط'; end if;
+  v_total := round(v_subtotal-v_discount+v_tax,4);
+  if v_total<=0 then raise exception 'إجمالي المستند يجب أن يكون أكبر من صفر'; end if;
+  if v_type in ('receipt','payment') then v_method:='cash'; end if;
+  if v_type='expense' and v_method='credit' and v_party is null then raise exception 'حدد الطرف عند تسجيل مصروف آجل'; end if;
+
+  v_doc_no := case v_type when 'sale' then 'SAL' when 'purchase' then 'PUR' when 'expense' then 'EXP' when 'receipt' then 'RCT' else 'PAY' end
+    || '-' || to_char(clock_timestamp(),'YYYYMMDD-HH24MISS-MS') || '-' || upper(substr(replace(gen_random_uuid()::text,'-',''),1,5));
+  insert into public.documents(doc_no,doc_type,party_id,document_date,currency,exchange_rate,settlement_method,cash_account_id,expense_account_id,subtotal,discount,tax,total,notes,created_by)
+  values(v_doc_no,v_type,v_party,v_date,v_currency,v_fx,v_method,v_cash_id,v_expense_account,v_subtotal,v_discount,v_tax,v_total,p_payload->>'notes',v_uid)
+  returning id into v_doc;
+
+  if v_type in ('sale','purchase') then
+    for v_line in select value from jsonb_array_elements(p_payload->'lines') loop
+      v_product := (v_line->>'product_id')::uuid; v_unit := (v_line->>'unit_id')::uuid;
+      v_qty := (v_line->>'quantity')::numeric; v_price := (v_line->>'unit_price')::numeric;
+      select pu.unit_name,pu.factor_to_base,pr.name into v_unit_name,v_factor,v_product_name
+      from public.product_units pu join public.products pr on pr.id=pu.product_id
+      where pu.id=v_unit and pu.product_id=v_product and pu.active and pr.active;
+      v_qty_base := round(v_qty*v_factor,6); v_line_total := round(v_qty*v_price,4);
+      insert into public.document_lines(document_id,product_id,product_name,unit_id,unit_name,quantity,factor_to_base,quantity_base,unit_price,line_total)
+      values(v_doc,v_product,v_product_name,v_unit,v_unit_name,v_qty,v_factor,v_qty_base,v_price,v_line_total);
+      -- Lock the product row before reading stock so concurrent cashiers cannot oversell stale quantities.
+      select avg_cost_base into v_avg_cost from public.products where id=v_product and active for update;
+      select coalesce(sum(sm.quantity_in-sm.quantity_out),0) into v_old_qty from public.stock_movements sm
+      where sm.product_id=v_product and sm.warehouse_id=v_warehouse;
+      if v_type='sale' then
+        if coalesce(v_avg_cost,0)<=0 then raise exception 'تكلفة الصنف غير محددة؛ سجّل فاتورة شراء أو رصيداً افتتاحياً بتكلفة صحيحة أولاً'; end if;
+        v_available := v_old_qty;
+        if v_available < v_qty_base then raise exception 'المخزون غير كافٍ للصنف: % (المتاح %)',(select name from public.products where id=v_product),v_available; end if;
+        insert into public.stock_movements(product_id,warehouse_id,document_id,movement_type,quantity_out,unit_cost_base,created_by)
+        values(v_product,v_warehouse,v_doc,'sale',v_qty_base,v_avg_cost,v_uid);
+        v_cost := v_cost+(v_qty_base*v_avg_cost);
+      else
+        insert into public.stock_movements(product_id,warehouse_id,document_id,movement_type,quantity_in,unit_cost_base,created_by)
+        values(v_product,v_warehouse,v_doc,'purchase',v_qty_base,round(v_price*v_fx/v_factor,6),v_uid);
+        perform set_config('shaibani.allow_cost_recalc','on',true);
+        update public.products set avg_cost_base=case when (v_old_qty+v_qty_base)>0
+          then round(((v_old_qty*v_avg_cost)+(v_qty_base*(v_price*v_fx/v_factor)))/(v_old_qty+v_qty_base),6)
+          else round(v_price*v_fx/v_factor,6) end
+        where id=v_product;
+        perform set_config('shaibani.allow_cost_recalc','off',true);
+      end if;
+    end loop;
+  end if;
+
+  v_entry_no := 'JE-'||to_char(clock_timestamp(),'YYYYMMDD-HH24MISS-MS')||'-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,4));
+  insert into public.journal_entries(entry_no,entry_date,description,document_id,created_by)
+  values(v_entry_no,v_date,case v_type when 'sale' then 'قيد فاتورة مبيعات '||v_doc_no when 'purchase' then 'قيد فاتورة مشتريات '||v_doc_no when 'expense' then 'قيد مصروف '||v_doc_no when 'receipt' then 'سند قبض '||v_doc_no else 'سند صرف '||v_doc_no end,v_doc,v_uid)
+  returning id into v_entry;
+  v_base_total := round(v_total*v_fx,4);
+
+  if v_type='sale' then
+    v_debit_account := case when v_method='cash' then v_cash_account else v_ar_account end;
+    v_revenue := round((v_subtotal-v_discount)*v_fx,4); v_tax_base:=round(v_tax*v_fx,4);
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_debit_account,v_base_total,v_currency,v_total,v_party,'إثبات قيمة البيع');
+    if v_revenue>0 then insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo)
+      values(v_entry,v_revenue_account,v_revenue,v_currency,v_subtotal-v_discount,v_party,'إيراد المبيعات'); end if;
+    if v_tax_base>0 then insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,memo)
+      values(v_entry,v_tax_account,v_tax_base,v_currency,v_tax,'الضريبة المستحقة'); end if;
+    if v_cost>0 then
+      insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,memo) values(v_entry,v_cogs_account,round(v_cost,4),v_currency,0,'تكلفة البضاعة المباعة');
+      insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,memo) values(v_entry,v_inventory_account,round(v_cost,4),v_currency,0,'تخفيض المخزون');
+    end if;
+  elsif v_type='purchase' then
+    v_credit_account := case when v_method='cash' then v_cash_account else v_ap_account end;
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_inventory_account,round(v_subtotal*v_fx,4),v_currency,v_subtotal,v_party,'إضافة مشتريات للمخزون');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_credit_account,round(v_subtotal*v_fx,4),v_currency,v_subtotal,v_party,'مقابل المشتريات');
+  elsif v_type='expense' then
+    v_credit_account := case when v_method='cash' then v_cash_account else v_ap_account end;
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_expense_account,v_base_total,v_currency,v_total,v_party,'إثبات المصروف');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_credit_account,v_base_total,v_currency,v_total,v_party,'الصندوق أو الطرف الدائن');
+  elsif v_type='receipt' then
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_cash_account,v_base_total,v_currency,v_total,v_party,'قبض من عميل');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_ar_account,v_base_total,v_currency,v_total,v_party,'تخفيض ذمم العملاء');
+  elsif v_type='payment' then
+    insert into public.journal_lines(entry_id,account_id,debit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_ap_account,v_base_total,v_currency,v_total,v_party,'تخفيض ذمم الموردين');
+    insert into public.journal_lines(entry_id,account_id,credit_base,currency,foreign_amount,party_id,memo)
+    values(v_entry,v_cash_account,v_base_total,v_currency,v_total,v_party,'صرف لمورد');
+  end if;
+
+  if abs((select coalesce(sum(debit_base-credit_base),0) from public.journal_lines where entry_id=v_entry))>0.01 then
+    raise exception 'القيد المحاسبي غير متوازن؛ أُلغيت العملية بالكامل';
+  end if;
+  return v_doc;
+end $$;
+revoke all on function public.post_document(jsonb) from public,anon;
+grant execute on function public.post_document(jsonb) to authenticated;
+
+-- تقارير مبنية على دفتر الأستاذ وحركات المخزون. security_invoker يحترم RLS للجداول الأساسية.
+create or replace view public.v_trial_balance with (security_invoker=true) as
+select a.id,a.code,a.name,a.account_type,a.normal_side,
+       coalesce(sum(jl.debit_base),0)::numeric(20,4) as debit,
+       coalesce(sum(jl.credit_base),0)::numeric(20,4) as credit,
+       coalesce(sum(jl.debit_base-jl.credit_base),0)::numeric(20,4) as net_balance
+from public.accounts a left join (select jl.* from public.journal_lines jl join public.journal_entries je on je.id=jl.entry_id where je.posted=true) jl on jl.account_id=a.id
+group by a.id,a.code,a.name,a.account_type,a.normal_side;
+create or replace view public.v_profit_loss with (security_invoker=true) as
+select a.account_type,a.code,a.name,
+       coalesce(sum(case when a.account_type='revenue' then jl.credit_base-jl.debit_base else jl.debit_base-jl.credit_base end),0)::numeric(20,4) as net_amount
+from public.accounts a left join (select jl.* from public.journal_lines jl join public.journal_entries je on je.id=jl.entry_id where je.posted=true) jl on jl.account_id=a.id
+where a.account_type in ('revenue','expense')
+group by a.account_type,a.code,a.name;
+create or replace view public.v_inventory_summary with (security_invoker=false) as
+select p.id,p.sku,p.name,p.base_unit,
+       case when public.current_app_role() in ('manager','accountant') then p.avg_cost_base else 0 end as avg_cost_base,
+       p.reorder_level,w.id as warehouse_id,w.name as warehouse_name,
+       coalesce(sum(sm.quantity_in-sm.quantity_out),0)::numeric(20,4) as quantity,
+       coalesce(sum(sm.quantity_in-sm.quantity_out),0)*case when public.current_app_role() in ('manager','accountant') then p.avg_cost_base else 0 end as inventory_value_base
+from public.products p cross join public.warehouses w
+left join public.stock_movements sm on sm.product_id=p.id and sm.warehouse_id=w.id
+where public.is_active_user() and p.active and w.active
+group by p.id,p.sku,p.name,p.base_unit,p.avg_cost_base,p.reorder_level,w.id,w.name;
+create or replace view public.v_cash_balances with (security_invoker=true) as
+select ca.id,ca.name,ca.currency,ca.account_id,
+       coalesce(sum(case when jl.debit_base>0 then jl.foreign_amount else -jl.foreign_amount end),0)::numeric(20,4) as foreign_balance
+from public.cash_accounts ca
+left join public.journal_lines jl on jl.account_id=ca.account_id and jl.currency=ca.currency
+left join public.journal_entries je on je.id=jl.entry_id and je.posted=true
+where ca.active and (jl.id is null or je.id is not null)
+group by ca.id,ca.name,ca.currency,ca.account_id;
+revoke all on public.v_trial_balance,public.v_profit_loss,public.v_inventory_summary,public.v_cash_balances from public,anon;
+grant select on public.v_trial_balance,public.v_profit_loss,public.v_inventory_summary,public.v_cash_balances to authenticated;
+
+-- Realtime: مزامنة جداول التشغيل المهمة بين جلسات الموظفين.
+do $$ declare t text; begin
+  foreach t in array array['documents','product_catalog_events','parties','stock_movements','profiles','exchange_rates'] loop
+    if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename=t) then
+      execute format('alter publication supabase_realtime add table public.%I',t);
+    end if;
+  end loop;
+exception when undefined_object then null; end $$;
+
+comment on function public.post_document(jsonb) is 'Atomic document posting: document + stock + balanced journal entry, role-checked against public.profiles';
