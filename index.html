@@ -8,11 +8,19 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/icons/icon-192.png" />
   <link rel="stylesheet" href="/styles.css" />
-  <title>نظام الشيباني المحاسبي المتكامل — الإصدار 2.0.1</title>
+  <title>نظام الشيباني المحاسبي المتكامل — الإصدار 2.2.1</title>
 </head>
 <body>
   <div id="app"><div class="boot">جاري تجهيز نظام الشيباني المحاسبي المتكامل…</div></div>
   <script src="/config.js"></script>
+  <script>
+    window.__SHAIBANI_BOOT_WATCHDOG__ = setTimeout(function () {
+      if (window.__SHAIBANI_APP_READY__) return;
+      var root = document.getElementById('app');
+      if (!root) return;
+      root.innerHTML = '<main style="font-family:system-ui, sans-serif;direction:rtl;text-align:center;padding:28px 18px;color:#173b31"><h2>تعذر تشغيل واجهة النظام</h2><p>لم يتم تحميل ملفات التطبيق أو خدمة الاتصال خلال الوقت المحدد.</p><p style="font-size:14px;color:#64748b">تحقق من اتصال الإنترنت، ثم أعد تحميل الصفحة. إذا استمرت المشكلة، امسح بيانات الموقع وذاكرة التطبيق المؤقتة ثم افتحه مجدداً.</p><button onclick="location.reload()" style="border:0;border-radius:12px;background:#147b62;color:white;padding:12px 24px;font-size:16px">إعادة المحاولة</button></main>';
+    }, 18000);
+  </script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

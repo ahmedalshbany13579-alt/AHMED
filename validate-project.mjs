@@ -27,6 +27,9 @@ try {
   const hardening = read('supabase/patches/06_security_and_validation_hardening.sql');
   const report = read('supabase/verification/security_hardening_check.sql');
   const css = read('styles.css');
+  const offlineStore = read('offline-store.js');
+  const duplicateGuard = read('supabase/patches/07_product_duplicate_guard.sql');
+  const duplicateReport = read('supabase/verification/product_duplicate_check.sql');
 
   for (const match of index.matchAll(/(?:src|href)="(\/(?:[^"?#]+))"/g)) {
     const asset = match[1].replace(/^\//, '');
@@ -71,9 +74,35 @@ try {
   assert(css.includes('.items-mobile-list {') && css.includes('display: none;') && css.includes('display: block;'), 'تعريف عرض متجاوب منفصل للجدول وبطاقات الهاتف');
   assert(css.includes('@media (max-width: 760px)') && css.includes('@media (max-width: 360px)'), 'إضافة نقاط توقف لشاشات الهاتف الصغيرة');
   assert(app.includes('data-action=\"new-product\"') && app.includes('data-action=\"import-items\"') && app.includes('data-action=\"new-stock-adjustment\"'), 'الإبقاء على إجراءات إضافة واستيراد وتسوية الأصناف');
-  assert(sw.includes('shaibani-shell-v9-mobile-items-layout'), 'تحديث ذاكرة PWA لإجبار تحميل تصميم الجوال الجديد');
+  assert(sw.includes('shaibani-shell-v13-startup-recovery'), 'تحديث ذاكرة PWA لنسخة مشاركة صورة الفاتورة');
+  assert(sw.includes("'/offline-store.js'") && existsSync(join(root, 'offline-store.js')), 'تخزين طبقة IndexedDB محلياً ضمن ملفات PWA');
+  assert(app.includes("from './offline-store.js'") && app.includes('saveOfflineProduct'), 'ربط التطبيق بمخزن IndexedDB وحفظ الأصناف محلياً');
+  assert(offlineStore.includes("createObjectStore('products'") && offlineStore.includes("createObjectStore('outbox'"), 'وجود مخازن الأصناف وطابور المزامنة المحلي');
+  assert(offlineStore.includes('current_qty_at_entry') && offlineStore.includes('serverBaselineQty'), 'حفظ خط أساس الخادم عند تعديلات الرصيد المتكررة دون اتصال');
+  assert(offlineStore.includes('transactionProducts = await requestResult(productStore.getAll())'), 'إعادة فحص التكرار داخل معاملة IndexedDB لمنع الحفظ المتزامن');
+  assert(offlineStore.includes('export function stockSyncDecision'), 'توفير قرار مزامنة الرصيد واكتشاف التعارض');
+  assert(app.includes('async function syncOfflineQueue') && app.includes("supabase.rpc('save_product'"), 'وجود مسار مزامنة الأصناف مع Supabase');
+  assert(app.includes('priority(a) - priority(b)') && app.includes("item.type === 'save_product' ? 0 : 1"), 'مزامنة تعريف الصنف قبل حركة رصيده');
+  assert(app.includes('stockSyncDecision(currentQty, baselineQty, targetQty)'), 'منع الكتابة فوق رصيد تغيّر على الخادم');
+  assert(app.includes('window.confirm(conflictMessage)'), 'طلب موافقة صريحة قبل اعتماد جرد يتعارض مع رصيد الخادم');
+  assert(app.includes('paddedBase64'), 'التحقق الصحيح من صلاحية رمز الدخول المخزّن محلياً');
+  assert(app.includes('data-product-autocomplete') && app.includes('renderProductSuggestions'), 'إظهار اقتراحات الأصناف عند الكتابة');
+  assert(app.includes("local_sync_state === 'pending'") && app.includes('const merged = new Map(serverProducts'), 'إبقاء الأصناف المحلية المعلقة ظاهرة بعد عودة الاتصال');
+  assert(app.includes('pendingCachedProduct || products.find'), 'السماح بفتح وتعديل الصنف المحلي المعلق بعد عودة الاتصال');
+  assert(app.includes('findDuplicateProduct') && app.includes('الصنف') && app.includes('موجود مسبقاً'), 'فحص تكرار الصنف قبل الحفظ محلياً');
+  assert(duplicateGuard.includes('pg_advisory_xact_lock') && duplicateGuard.includes('trg_reject_duplicate_product_identity'), 'حارس قاعدة البيانات يمنع الإدخالات المتزامنة المكررة');
+  assert(duplicateGuard.includes('products_active_name_identity_uidx') && duplicateGuard.includes('products_active_sku_identity_uidx'), 'فهارس فريدة لفرض عدم تكرار الاسم والرمز على الخادم');
+  assert(duplicateGuard.includes('normalize_product_identity') && duplicateGuard.includes('translate('), 'تطبيع الهمزات والتشكيل والتطويل في منع التكرار على الخادم');
+  assert(duplicateGuard.includes('if not coalesce(new.active, true) then'), 'السماح بتعطيل صنف قديم مكرر أثناء تنظيف البيانات');
+  assert(duplicateReport.includes('having count(*) > 1') && duplicateReport.includes('translate('), 'استعلام مستقل لكشف التكرارات العربية قبل تفعيل الحارس');
+  assert(app.includes("window.addEventListener('online'") && app.includes("window.addEventListener('offline'"), 'مراقبة الاتصال وتشغيل المزامنة التلقائية');
+  assert(existsSync(join(root, 'README_OFFLINE_FIRST_AR.md')), 'توفير دليل عربي لتشغيل وضع عدم الاتصال');
+  assert(app.includes('async function renderInvoicePng(data)') && app.includes('image/png'), 'توليد صورة PNG فعلية للفاتورة');
+  assert(app.includes('navigator.canShare({ files: [file] })') && app.includes('navigator.share({ files: [file]'), 'مشاركة ملف صورة الفاتورة عبر واجهة المشاركة الأصلية للهاتف');
+  assert(app.includes('a.download = file.name') && app.includes('افتح واتساب وأرفق الصورة'), 'تنزيل صورة الفاتورة كبديل عند عدم دعم مشاركة الملفات');
+  assert(app.includes('إرسال صورة الفاتورة عبر واتساب') && !app.includes('https://wa.me/${digits}?text=${encodeURIComponent(invoiceShareText(data))}'), 'استبدال إرسال نص الفاتورة بمسار مشاركة الصورة');
 
-  for (const file of ['app.js', 'sw.js', 'scripts/validate-project.mjs']) {
+  for (const file of ['app.js', 'offline-store.js', 'sw.js', 'scripts/validate-project.mjs', 'tests/offline-store.test.mjs']) {
     execFileSync(process.execPath, ['--check', join(root, file)], { stdio: 'pipe' });
     pass(`فحص JavaScript syntax: ${file}`);
   }

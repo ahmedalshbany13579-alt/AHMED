@@ -1,5 +1,31 @@
+import {
+  initOfflineStore, normalizeProductKey, findDuplicateProduct, stockSyncDecision,
+  getCachedProducts, cacheProducts, getSnapshot, setSnapshot,
+  cacheProfile, getCachedProfile, saveOfflineProduct,
+  getOutbox, getOutboxCount, updateOutboxItem, removeOutboxItem,
+  resolveProductId, markProductSynced, updateCachedProduct, queueOfflineStockTarget
+} from './offline-store.js';
+
 async function createSupabaseLiveClient(url, key, options) {
-  const mod = await import('https://esm.sh/@supabase/supabase-js@2.118.0');
+  let mod;
+  try {
+    mod = await withTimeout(
+      import('https://esm.sh/@supabase/supabase-js@2.118.0'),
+      12000,
+      'انتهت مهلة تحميل مكتبة الاتصال. تحقق من الإنترنت أو أعد المحاولة.'
+    );
+  } catch (firstError) {
+    try {
+      mod = await withTimeout(
+        import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/+esm'),
+        10000,
+        'تعذر تحميل مكتبة Supabase من المصدرين.'
+      );
+    } catch (_secondError) {
+      throw new Error('تعذر تحميل مكتبة الاتصال بقاعدة البيانات. قد يكون اتصال الإنترنت أو حجب مكتبات CDN هو السبب.');
+    }
+  }
+  if (!mod?.createClient) throw new Error('تم تحميل مكتبة Supabase لكن دالة إنشاء الاتصال غير متاحة.');
   return mod.createClient(url, key, options);
 }
 
@@ -11,6 +37,17 @@ const LOGO_SRC = window.SHAIBANI_LOGO_DATA_URI || '/icons/shaibani-logo.jpg';
 const BANNER_SRC = window.SHAIBANI_BANNER_DATA_URI || '/icons/shaibani-banner.svg';
 
 const app = document.getElementById('app');
+function markAppReady() {
+  window.__SHAIBANI_APP_READY__ = true;
+  if (window.__SHAIBANI_BOOT_WATCHDOG__) clearTimeout(window.__SHAIBANI_BOOT_WATCHDOG__);
+}
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })
+  ]).finally(() => clearTimeout(timer));
+}
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const escapeHtml = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -43,6 +80,9 @@ let cachedProducts = [];
 let cachedParties = [];
 let cachedCash = [];
 let installPrompt = null;
+let offlineSessionActive = false;
+let offlineSyncInProgress = false;
+let offlineStoreReady = initOfflineStore().catch(err => { console.warn('Offline storage unavailable:', err); return null; });
 // Reuse one in-flight loader so multiple import actions never inject duplicate scripts.
 let xlsxLibraryPromise = null;
 
@@ -57,6 +97,195 @@ let posSettlement = 'cash';
 let posCurrency = 'YER';
 let posDiscount = 0;
 let posTax = 0;
+
+
+function isPersistentOfflineSession() {
+  return !isDemoMode && (offlineSessionActive || !navigator.onLine || !supabase);
+}
+
+function updateConnectionBadge(message = '') {
+  const el = $('#connection-status');
+  if (!el) return;
+  if (isDemoMode) { el.textContent = '● محاكاة محلية'; return; }
+  const pending = Number(el.dataset.pending || 0);
+  if (offlineSessionActive || !navigator.onLine || !supabase) {
+    el.textContent = `● دون اتصال${pending ? ` · ${pending} معلّق` : ''}`;
+    el.classList.add('offline-status');
+  } else {
+    el.textContent = message || (pending ? `● متصل · ${pending} بانتظار المزامنة` : '● متصل ومتزامن');
+    el.classList.remove('offline-status');
+  }
+}
+
+async function refreshOfflineBadge() {
+  try {
+    const count = await getOutboxCount();
+    const el = $('#connection-status');
+    if (el) el.dataset.pending = String(count);
+  } catch (_e) { /* IndexedDB may be unavailable in private browsing */ }
+  updateConnectionBadge();
+}
+
+async function loadInventorySummary() {
+  if (!isPersistentOfflineSession()) {
+    try {
+      const rows = await queryOrThrow(supabase.from('v_inventory_summary').select('id,quantity,inventory_value_base'));
+      // لا تستبدل تعديلاً محلياً معلقاً برصيد الخادم القديم عند فشل جزئي في المزامنة.
+      const pendingStock = (await getOutbox()).filter(item => item.type === 'stock_target');
+      const cached = await getCachedProducts();
+      for (const item of pendingStock) {
+        const remoteId = await resolveProductId(item.local_product_id);
+        let row = rows.find(entry => String(entry.id) === String(remoteId))
+          || rows.find(entry => String(entry.id) === String(item.local_product_id));
+        if (!row) {
+          const product = cached.find(entry => String(entry.id) === String(item.local_product_id));
+          row = {
+            id: remoteId,
+            quantity: 0,
+            inventory_value_base: Number(item.target_qty) * Number(product?.avg_cost_base || 0)
+          };
+          rows.push(row);
+        }
+        row.quantity = Number(item.target_qty);
+      }
+      await setSnapshot('inventory-summary', rows);
+      return rows;
+    } catch (err) {
+      console.warn('تعذر تحديث أرصدة المخزون؛ سيتم استخدام النسخة المحلية إن وجدت.', err);
+    }
+  }
+  return (await getSnapshot('inventory-summary')) || [];
+}
+
+function getValidStoredAuthSession(profileId) {
+  try {
+    const projectRef = new URL(cfg.SUPABASE_URL).hostname.split('.')[0];
+    const raw = localStorage.getItem(`sb-${projectRef}-auth-token`);
+    if (!raw) return null;
+    const stored = JSON.parse(raw);
+    const token = stored?.access_token;
+    const userId = stored?.user?.id;
+    if (!token || userId !== profileId) return null;
+    const encoded = token.split('.')[1];
+    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const paddedBase64 = base64 + '='.repeat((4 - base64.length % 4) % 4);
+    const payload = JSON.parse(atob(paddedBase64));
+    if (!payload.exp || Number(payload.exp) * 1000 <= Date.now() + 30000) return null;
+    return stored;
+  } catch (_e) { return null; }
+}
+
+async function startCachedOfflineSession(silent = false) {
+  await offlineStoreReady;
+  const cached = await getCachedProfile();
+  if (!cached?.id || !cached.is_active) {
+    if (!silent) toast('لا توجد جلسة موثقة سابقة محفوظة على هذا الجهاز.', true);
+    return false;
+  }
+  const storedSession = getValidStoredAuthSession(cached.id);
+  if (!storedSession) {
+    if (!silent) toast('لا توجد جلسة دخول محلية صالحة. اتصل بالإنترنت وسجّل الدخول أولاً.', true);
+    return false;
+  }
+  isDemoMode = false;
+  offlineSessionActive = true;
+  supabase = null;
+  session = { user: storedSession.user, access_token: storedSession.access_token };
+  profile = { id: cached.id, full_name: cached.full_name, role: cached.role, is_active: true };
+  cachedProducts = await getCachedProducts();
+  currentPage = 'items';
+  buildShell();
+  await renderPage();
+  await refreshOfflineBadge();
+  return true;
+}
+
+async function ensureLiveSupabaseClient() {
+  if (supabase) return supabase;
+  if (!navigator.onLine || !configured || isDemoMode) return null;
+  supabase = await createSupabaseLiveClient(cfg.SUPABASE_URL, supabaseApiKey, {
+    db: { schema: cfg.SUPABASE_SCHEMA || 'shaibani_erp' },
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+  });
+  const { data: { session: restored } } = await supabase.auth.getSession();
+  if (restored) session = restored;
+  return supabase;
+}
+
+async function syncOfflineQueue(showMessage = true) {
+  if (offlineSyncInProgress) return;
+  if (isDemoMode) { if (showMessage) toast('بيانات وضع المحاكاة محلية ولا تُرفع إلى قاعدة Supabase.'); return; }
+  if (!navigator.onLine) { if (showMessage) toast('لا يوجد اتصال بالإنترنت؛ ستبقى العمليات محفوظة محلياً.', true); return; }
+  offlineSyncInProgress = true;
+  try {
+    await ensureLiveSupabaseClient();
+    if (!supabase?.rpc) throw new Error('تعذر استعادة اتصال Supabase. أعد تسجيل الدخول عند الحاجة.');
+    // احفظ تعريفات الأصناف أولاً دائماً، ثم رحّل أرصدتها حتى عند تعديل الصفوف مرات متعددة دون اتصال.
+    const priority = item => item.type === 'save_product' ? 0 : 1;
+    const queue = (await getOutbox()).sort((a, b) => priority(a) - priority(b) || String(a.created_at).localeCompare(String(b.created_at)));
+    let synced = 0, failed = 0;
+    const failedReasons = [];
+    for (const item of queue) {
+      try {
+        if (item.type === 'save_product') {
+          const result = await supabase.rpc('save_product', { p_payload: item.payload });
+          if (result.error || !result.data) throw new Error(result.error?.message || 'لم يُرجع الخادم معرّف الصنف');
+          await markProductSynced(item.local_product_id, result.data);
+          await removeOutboxItem(item.id);
+          synced++;
+        } else if (item.type === 'stock_target') {
+          const remoteId = await resolveProductId(item.local_product_id);
+          if (String(remoteId).startsWith('local-')) throw new Error('ينتظر هذا الرصيد مزامنة بيانات الصنف أولاً');
+          const inventory = await supabase.from('v_inventory_summary').select('quantity').eq('id', remoteId).maybeSingle();
+          if (inventory.error) throw inventory.error;
+          const currentQty = Number(inventory.data?.quantity || 0);
+          const targetQty = Number(item.target_qty);
+          const baselineQty = Number(item.current_qty_at_entry || 0);
+          // إذا انقطعت الاستجابة بعد نجاح الترحيل، لا نكرر الحركة ما دام الخادم وصل للهدف.
+          const stockDecision = stockSyncDecision(currentQty, baselineQty, targetQty);
+          if (stockDecision === 'already_applied') {
+            await removeOutboxItem(item.id);
+            synced++;
+            continue;
+          }
+          // لا تكتب فوق حركة أجراها مستخدم آخر أثناء بقاء هذا الجهاز دون اتصال.
+          if (stockDecision === 'conflict') {
+            const conflictMessage = `تغيّر رصيد الصنف أثناء انقطاع هذا الجهاز.\n\nالرصيد المحفوظ عند بدء التعديل: ${baselineQty}\nالرصيد الحالي على الخادم: ${currentQty}\nالكمية المحلية المطلوب اعتمادها: ${targetQty}\n\nهل تريد اعتماد الكمية المحلية كجرد نهائي؟ سيُنشئ النظام حركة تسوية على الرصيد الحالي في الخادم.`;
+            const approved = showMessage && window.confirm(conflictMessage);
+            if (!approved) {
+              throw new Error(`تعارض رصيد الصنف: الخادم ${currentQty}، والكمية المحلية ${targetQty}. لم يتم الكتابة فوق رصيد الخادم؛ راجع العملية ثم أعد المزامنة.`);
+            }
+          }
+          const stockResult = await applyProductStockTarget(remoteId, currentQty, targetQty, Number(item.unit_cost_base || 1), item.notes || 'تحديث رصيد محفوظ دون اتصال');
+          if (!stockResult.ok) throw new Error(stockResult.error || 'تعذر ترحيل حركة المخزون');
+          await removeOutboxItem(item.id);
+          synced++;
+        }
+      } catch (err) {
+        failed++;
+        failedReasons.push(err.message || String(err));
+        await updateOutboxItem({ ...item, status: 'failed', attempts: Number(item.attempts || 0) + 1, last_error: err.message || String(err), last_attempt_at: new Date().toISOString() });
+      }
+    }
+    offlineSessionActive = false;
+    cachedProducts = [];
+    if (supabase) {
+      try { await loadProducts(); await loadInventorySummary(); } catch (_e) { /* Keep local copy until next sync */ }
+    }
+    await refreshOfflineBadge();
+    if (currentPage === 'items') await renderPage();
+    if (showMessage) {
+      const firstFailure = failedReasons[0] ? `
+السبب الأول: ${failedReasons[0]}` : '';
+      toast(`انتهت المزامنة: تم إرسال ${synced} عملية، وتعذّر ${failed}.${firstFailure}`, failed > 0);
+    }
+  } catch (err) {
+    if (showMessage) toast('تعذرت المزامنة: ' + (err.message || err), true);
+  } finally {
+    offlineSyncInProgress = false;
+    await refreshOfflineBadge();
+  }
+}
 
 // Invoice Modal State
 let activeSaleProducts = [];
@@ -1015,7 +1244,7 @@ function table(headers, rows, tableId = '') {
 }
 
 function field(label, name, value = '', type = 'text', opts = {}) {
-  return `<div class="field ${opts.full ? 'full' : ''}"><label>${label}</label><input class="control" name="${name}" type="${type}" value="${escapeHtml(value)}" ${opts.required ? 'required' : ''} ${opts.step ? `step="${opts.step}"` : ''} ${opts.min !== undefined ? `min="${opts.min}"` : ''} ${opts.readonly ? 'readonly' : ''} ${opts.placeholder ? `placeholder="${escapeHtml(opts.placeholder)}"` : ''}></div>`;
+  return `<div class="field ${opts.full ? 'full' : ''}"><label>${label}</label><input class="control" name="${name}" type="${type}" value="${escapeHtml(value)}" ${opts.required ? 'required' : ''} ${opts.step ? `step="${opts.step}"` : ''} ${opts.min !== undefined ? `min="${opts.min}"` : ''} ${opts.readonly ? 'readonly' : ''} ${opts.placeholder ? `placeholder="${escapeHtml(opts.placeholder)}"` : ''} ${opts.attrs || ''}></div>`;
 }
 
 function selectField(label, name, options, value = '', full = false, disabled = false) {
@@ -1043,6 +1272,10 @@ function closeModal() {
 }
 
 function setPage(t) {
+  if (isPersistentOfflineSession() && t !== 'items') {
+    toast('هذه الشاشة تحتاج إلى اتصال بالخادم. يمكنك إدارة الأصناف المحفوظة محلياً ثم مزامنتها عند عودة الإنترنت.', true);
+    t = 'items';
+  }
   currentPage = t;
   $$('[data-page]').forEach(x => x.classList.toggle('active', x.dataset.page === t));
   renderPage();
@@ -1098,6 +1331,7 @@ function docBadgeClass(t) {
    ============================================================================ */
 function startDemoSession(role = 'manager') {
   isDemoMode = true;
+  offlineSessionActive = false;
   supabase = createDemoSupabaseClient();
   const db = loadDemoDB();
   const found = db.profiles.find(p => p.role === role) || db.profiles[0];
@@ -1115,16 +1349,18 @@ function startDemoSession(role = 'manager') {
 }
 
 function showConfig() {
+  markAppReady();
   showLogin('يمكنك الدخول فوراً في وضع النموذج التفاعلي المتكامل أو ربط مشروع Supabase في config.js');
 }
 
 function showLogin(message = '') {
+  markAppReady();
   app.innerHTML = `
     <div class="auth-shell">
       <div class="auth-container">
         <div class="auth-hero">
           <div>
-            <span class="auth-hero-badge">✦ الإصدار 2.0.1</span>
+            <span class="auth-hero-badge">✦ الإصدار 2.1.0</span>
             <h2>نظام الشيباني المحاسبي والإداري المتكامل</h2>
             <p>منظومة ERP محاسبية ومخزنية متكاملة مصممة خصيصاً لمحلات الشيباني للبهارات والأعشاب الطبيعية — تدعم تعدد الوحدات، تعدد العملات، نقطة البيع السريعة، الجرد، والميزانية الختامية.</p>
             <div class="auth-features">
@@ -1152,6 +1388,8 @@ function showLogin(message = '') {
               <input class="control" name="password" type="password" required autocomplete="current-password" placeholder="••••••••">
             </div>
             <button class="btn full" type="submit" style="margin-top:6px;padding:11px">🔐 تسجيل الدخول لقاعدة البيانات</button>
+            <button class="btn light full" type="button" data-action="start-offline" style="margin-top:8px">📴 فتح بيانات هذا الجهاز دون اتصال</button>
+            <small class="hint">يتطلب جلسة Supabase سابقة ما زالت صالحة على هذا الجهاز. وضع عدم الاتصال مخصص مؤقتاً لإدارة دليل الأصناف والأرصدة المخزنة محلياً.</small>
           </form>
           <div class="demo-launch-box">
             <strong>🚀 تجربة النموذج التفاعلي الحديث (بدون اتصال خارجي)</strong>
@@ -1201,6 +1439,19 @@ async function afterLogin() {
   }
   const { data: p, error } = await supabase.from('profiles').select('id,full_name,role,is_active').eq('id', s.user.id).maybeSingle();
   if (error) {
+    const cached = await getCachedProfile();
+    const locallyValidSession = getValidStoredAuthSession(cached?.id);
+    if (!navigator.onLine && cached?.id === s.user.id && cached.is_active && locallyValidSession) {
+      session = { user: locallyValidSession.user, access_token: locallyValidSession.access_token };
+      profile = { id: cached.id, full_name: cached.full_name, role: cached.role, is_active: true };
+      offlineSessionActive = true;
+      currentPage = 'items';
+      cachedProducts = await getCachedProducts();
+      buildShell();
+      await renderPage();
+      await refreshOfflineBadge();
+      return;
+    }
     await supabase.auth.signOut();
     session = null;
     showLogin('تعذر قراءة ملف الموظف من مخطط ' + (cfg.SUPABASE_SCHEMA || 'shaibani_erp') + ': ' + error.message);
@@ -1213,15 +1464,22 @@ async function afterLogin() {
     return;
   }
   profile = p;
+  offlineSessionActive = false;
+  await cacheProfile(profile);
   cachedProducts = [];
   cachedParties = [];
   cachedCash = [];
   buildShell();
   await renderPage();
+  // ابدأ بناء النسخة المحلية فور الدخول حتى تتوفر البيانات عند انقطاع الاتصال لاحقاً.
+  try { await loadProducts(); await loadInventorySummary(); } catch (err) { console.warn('تعذر إكمال التخزين المحلي الأولي:', err); }
   subscribeRealtime();
+  await refreshOfflineBadge();
+  if (navigator.onLine) await syncOfflineQueue(false);
 }
 
 function buildShell() {
+  markAppReady();
   const groups = [
     {
       label: 'التشغيل ونقطة البيع',
@@ -1313,7 +1571,8 @@ function buildShell() {
           <div class="top-actions">
             <button class="btn gold" type="button" data-action="new-sale">＋ فاتورة بيع</button>
             <button class="btn light" type="button" id="theme-toggle-btn" data-action="toggle-theme">${isDark ? '☀️ نهاري' : '🌙 ليلي'}</button>
-            <span class="status" id="connection-status">${isDemoMode ? '● محاكاة نشطة' : '● متصل'}</span>
+            <button class="btn light offline-sync-btn" type="button" data-action="sync-now" title="مزامنة العمليات المحفوظة محلياً">⇅ مزامنة</button>
+            <span class="status" id="connection-status">${isDemoMode ? '● محاكاة محلية' : (offlineSessionActive || !navigator.onLine ? '● دون اتصال' : '● متصل')}</span>
             <span class="user-chip">${escapeHtml(profile.full_name || session?.user?.email || '')}</span>
             <button class="btn light" type="button" data-action="logout">${isDemoMode ? 'شاشة الدخول' : 'خروج'}</button>
           </div>
@@ -1357,24 +1616,56 @@ async function queryOrThrow(q) {
 
 async function loadProducts() {
   if (cachedProducts.length) return cachedProducts;
-  const [p, u] = await Promise.all([
-    queryOrThrow(supabase.from('v_products').select('*').order('name')),
-    queryOrThrow(supabase.from('v_product_units').select('*'))
-  ]);
-  cachedProducts = p.map(x => ({ ...x, units: u.filter(a => a.product_id === x.id) }));
+  if (!isPersistentOfflineSession() && supabase) {
+    try {
+      const [p, u] = await Promise.all([
+        queryOrThrow(supabase.from('v_products').select('*').order('name')),
+        queryOrThrow(supabase.from('v_product_units').select('*'))
+      ]);
+      const serverProducts = p.map(x => ({ ...x, units: u.filter(a => a.product_id === x.id) }));
+      await cacheProducts(serverProducts);
+      // احتفظ بالأصناف التي ما زالت معلّقة محلياً ولا تخفها عند نجاح قراءة الخادم.
+      const localRows = await getCachedProducts();
+      const merged = new Map(serverProducts.map(product => [String(product.id), product]));
+      for (const localProduct of localRows) {
+        if (localProduct.local_sync_state === 'pending' || String(localProduct.id).startsWith('local-')) {
+          merged.set(String(localProduct.id), localProduct);
+        }
+      }
+      cachedProducts = [...merged.values()].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ar'));
+      return cachedProducts;
+    } catch (err) {
+      console.warn('تعذر تحميل الأصناف من الخادم؛ سيتم استخدام النسخة المحلية.', err);
+    }
+  }
+  cachedProducts = await getCachedProducts();
   return cachedProducts;
 }
 
 async function loadParties() {
   if (cachedParties.length) return cachedParties;
-  const cols = canFinance() ? '*' : 'id,party_type,name,phone,address,active,created_at,updated_at';
-  cachedParties = await queryOrThrow(supabase.from('parties').select(cols).eq('active', true).order('name'));
+  if (!isPersistentOfflineSession() && supabase) {
+    try {
+      const cols = canFinance() ? '*' : 'id,party_type,name,phone,address,active,created_at,updated_at';
+      cachedParties = await queryOrThrow(supabase.from('parties').select(cols).eq('active', true).order('name'));
+      await setSnapshot('parties', cachedParties);
+      return cachedParties;
+    } catch (_e) { /* Fallback to last cached list */ }
+  }
+  cachedParties = (await getSnapshot('parties')) || [];
   return cachedParties;
 }
 
 async function loadCash() {
   if (cachedCash.length) return cachedCash;
-  cachedCash = await queryOrThrow(supabase.from('cash_accounts').select('id,name,currency,account_id').eq('active', true).order('name'));
+  if (!isPersistentOfflineSession() && supabase) {
+    try {
+      cachedCash = await queryOrThrow(supabase.from('cash_accounts').select('id,name,currency,account_id').eq('active', true).order('name'));
+      await setSnapshot('cash-accounts', cachedCash);
+      return cachedCash;
+    } catch (_e) { /* Fallback to last cached list */ }
+  }
+  cachedCash = (await getSnapshot('cash-accounts')) || [];
   return cachedCash;
 }
 
@@ -1923,7 +2214,7 @@ async function documentsPage(type) {
    ============================================================================ */
 async function itemsPage() {
   const p = await loadProducts();
-  const inv = await queryOrThrow(supabase.from('v_inventory_summary').select(canFinance() ? 'id,quantity,inventory_value_base' : 'id,quantity'));
+  const inv = await loadInventorySummary();
   const qty = new Map(inv.map(x => [x.id, Number(x.quantity || 0)]));
 
   const desktopRows = p.map(x => {
@@ -2020,6 +2311,7 @@ async function itemsPage() {
 }
 
 async function openStockCard(productId) {
+  if (isPersistentOfflineSession()) { toast('كارت الحركات التفصيلي غير مخزن محلياً حالياً؛ ستتوفر بياناته بعد الاتصال.', true); return; }
   const products = await loadProducts();
   const prod = products.find(p => p.id === productId);
   if (!prod) return;
@@ -3268,6 +3560,10 @@ async function saveSaleUnitFromInvoice() {
 }
 
 async function openUnifiedInvoice(docType = 'sale') {
+  if (isPersistentOfflineSession()) {
+    toast('يمكنك استعراض الأصناف وتسجيلها محلياً دون اتصال، أما ترحيل الفواتير والقيود المالية فيحتاج إلى اتصال بالخادم لضمان سلامة الأرصدة.');
+    return;
+  }
   try {
     activeInvoiceDocType = docType;
     const isPurchaseSide = ['purchase', 'purchase_return'].includes(docType);
@@ -3359,7 +3655,8 @@ async function openUnifiedInvoice(docType = 'sale') {
           <div class="sale-entry-grid">
             <div class="field sale-entry-product">
               <label for="sale-entry-name">الصنف (مسجل أو صنف جديد)</label>
-              <input class="control" id="sale-entry-name" list="sale-product-options" autocomplete="off" placeholder="اكتب اسم الصنف (مثال: لوز برازيلي)…">
+              <input class="control" id="sale-entry-name" data-product-autocomplete list="sale-product-options" autocomplete="off" placeholder="اكتب اسم الصنف لعرض الأصناف المسجلة…">
+              <div class="product-suggestions" data-suggestions-for="sale-entry-name" hidden></div>
               <datalist id="sale-product-options">${activeSaleProducts.flatMap(p => [p.name, p.sku].filter(Boolean)).map(v => `<option value="${escapeHtml(v)}"></option>`).join('')}</datalist>
               <input id="sale-entry-product-id" type="hidden">
               <small id="sale-entry-status" class="sale-field-hint">اكتب اسم صنف مسجل أو صنف جديد لإضافته تلقائياً</small>
@@ -3762,41 +4059,41 @@ async function applyProductStockTarget(productId, currentQty, targetQty, unitCos
   if (Math.abs(diff) < 0.000001) return { ok: true };
   const safeCost = Number(unitCostBase) > 0 ? Number(unitCostBase) : 1;
 
-  // First try set_opening_stock if currentQty === 0 and targetQty > 0
-  if (Number(currentQty || 0) === 0 && targetQty > 0) {
-    const opened = await supabase.rpc('set_opening_stock', {
-      p_product_id: productId,
-      p_quantity_base: Number(targetQty),
-      p_unit_cost_base: safeCost
-    });
-    if (!opened.error) return { ok: true };
-    // If set_opening_stock failed because prior movements exist, fall through to post_stock_adjustment
-  }
-
-  const adj = await supabase.rpc('post_stock_adjustment', {
-    p_payload: {
-      product_id: productId,
-      direction: diff > 0 ? 'in' : 'out',
-      quantity_base: Math.abs(diff),
-      unit_cost_base: safeCost,
-      notes
+  try {
+    // First try set_opening_stock if currentQty === 0 and targetQty > 0
+    if (Number(currentQty || 0) === 0 && targetQty > 0) {
+      const opened = await supabase.rpc('set_opening_stock', {
+        p_product_id: productId,
+        p_quantity_base: Number(targetQty),
+        p_unit_cost_base: safeCost
+      });
+      if (!opened.error) return { ok: true };
+      // If set_opening_stock failed because prior movements exist, fall through to post_stock_adjustment
     }
-  });
-  if (adj.error) {
-    return { ok: false, error: adj.error.message || String(adj.error) };
+
+    const adj = await supabase.rpc('post_stock_adjustment', {
+      p_payload: {
+        product_id: productId,
+        direction: diff > 0 ? 'in' : 'out',
+        quantity_base: Math.abs(diff),
+        unit_cost_base: safeCost,
+        notes
+      }
+    });
+    if (adj.error) return { ok: false, error: adj.error.message || String(adj.error) };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
   }
-  return { ok: true };
 }
 
 async function openStockQtyModal(productId) {
   if (!canFinance()) return;
-  const [products, invResult] = await Promise.all([
-    loadProducts(),
-    supabase.from('v_inventory_summary').select('quantity').eq('id', productId).maybeSingle()
-  ]);
+  const products = await loadProducts();
+  const inventory = await loadInventorySummary();
   const prod = products.find(p => p.id === productId);
   if (!prod) { toast('الصنف غير موجود', true); return; }
-  const currentQty = Number(invResult.data?.quantity || 0);
+  const currentQty = Number(inventory.find(x => String(x.id) === String(productId))?.quantity || 0);
   const baseUnitObj = (prod.units || []).find(u => u.is_base) || prod.units?.[0];
   const defaultCost = Number(prod.avg_cost_base || baseUnitObj?.purchase_price || 1);
 
@@ -3897,6 +4194,23 @@ async function openStockQtyModal(productId) {
     e.preventDefault();
     const targetQty = calcPreview();
     const cost = Number($('#qsq-cost-input').value || defaultCost || 1);
+    if (isPersistentOfflineSession()) {
+      const localSave = await saveOfflineProduct({
+        id: prod.id, name: prod.name, sku: prod.sku || null, category: prod.category || null,
+        base_unit: prod.base_unit, purchase_price: Number(baseUnitObj?.purchase_price || 0),
+        sale_price: Number(baseUnitObj?.sale_price || 0), currency: baseUnitObj?.currency || 'YER',
+        avg_cost_base: Number(prod.avg_cost_base || cost), reorder_level: Number(prod.reorder_level || 0),
+        description: prod.description || null,
+        units: (prod.units || []).filter(u => !u.is_base).map(u => ({ unit_name: u.unit_name, factor_to_base: Number(u.factor_to_base), purchase_price: Number(u.purchase_price || 0), sale_price: Number(u.sale_price || 0) }))
+      }, { currentQty, stockTarget: targetQty, unitCostBase: cost, notes: 'تعديل الكمية المتوفرة من نافذة الكمية' });
+      if (!localSave.ok) { toast(localSave.message, true); return; }
+      cachedProducts = await getCachedProducts();
+      closeModal();
+      await renderPage();
+      await refreshOfflineBadge();
+      toast(`حُفظ رصيد «${prod.name}» محلياً وسيُرحّل عند عودة الإنترنت.`);
+      return;
+    }
     const res = await applyProductStockTarget(productId, currentQty, targetQty, cost, 'تعديل الكمية المتوفرة من نافذة الكمية');
     if (!res.ok) {
       toast('تعذر تحديث الكمية: ' + res.error, true);
@@ -3904,6 +4218,7 @@ async function openStockQtyModal(productId) {
     }
     closeModal();
     cachedProducts = [];
+    await loadInventorySummary();
     await renderPage();
     toast(`تم تحديث الكمية المتوفرة للصنف «${prod.name}» إلى ${money(targetQty, 4)} ${prod.base_unit}`);
   };
@@ -3912,21 +4227,34 @@ async function openStockQtyModal(productId) {
 async function openProduct(id = null) {
   let old = null, baseUnitObj = null, extraUnits = [], currentQty = 0, hasMovements = false;
   if (id) {
-    const [productResult, unitsResult, invResult] = await Promise.all([
-      supabase.from('v_products').select('*').eq('id', id).single(),
-      supabase.from('v_product_units').select('*').eq('product_id', id),
-      supabase.from('v_inventory_summary').select('quantity').eq('id', id).maybeSingle()
-    ]);
-    if (productResult.error || unitsResult.error) {
-      toast(productResult.error?.message || unitsResult.error?.message, true);
-      return;
+    const pendingCachedProduct = (await getCachedProducts()).find(product => String(product.id) === String(id) && product.local_sync_state === 'pending');
+    if (isPersistentOfflineSession() || pendingCachedProduct || String(id).startsWith('local-')) {
+      const products = await loadProducts();
+      old = pendingCachedProduct || products.find(x => String(x.id) === String(id));
+      if (!old) { toast('الصنف غير موجود في النسخة المحلية. اتصل بالإنترنت لمزامنة دليل الأصناف.', true); return; }
+      const units = old.units || [];
+      baseUnitObj = units.find(x => x.is_base) || units.find(x => x.unit_name === old.base_unit) || units[0];
+      extraUnits = units.filter(x => !x.is_base && x.id !== baseUnitObj?.id);
+      const inventory = await loadInventorySummary();
+      currentQty = Number(inventory.find(x => String(x.id) === String(id))?.quantity || 0);
+      hasMovements = currentQty > 0;
+    } else {
+      const [productResult, unitsResult, invResult] = await Promise.all([
+        supabase.from('v_products').select('*').eq('id', id).single(),
+        supabase.from('v_product_units').select('*').eq('product_id', id),
+        supabase.from('v_inventory_summary').select('quantity').eq('id', id).maybeSingle()
+      ]);
+      if (productResult.error || unitsResult.error) {
+        toast(productResult.error?.message || unitsResult.error?.message, true);
+        return;
+      }
+      old = productResult.data;
+      const units = unitsResult.data || [];
+      baseUnitObj = units.find(x => x.is_base) || units.find(x => x.unit_name === old.base_unit) || units[0];
+      extraUnits = units.filter(x => !x.is_base && x.id !== baseUnitObj?.id);
+      currentQty = Number(invResult.data?.quantity || 0);
+      hasMovements = currentQty > 0;
     }
-    old = productResult.data;
-    const units = unitsResult.data || [];
-    baseUnitObj = units.find(x => x.is_base) || units.find(x => x.unit_name === old.base_unit) || units[0];
-    extraUnits = units.filter(x => !x.is_base && x.id !== baseUnitObj?.id);
-    currentQty = Number(invResult.data?.quantity || 0);
-    hasMovements = currentQty > 0;
   }
 
   const unitRowsHtml = extraUnits.map(u => `
@@ -3946,7 +4274,8 @@ async function openProduct(id = null) {
 
   const body = `
     <form id="product-form" class="form-grid">
-      ${field('اسم الصنف', 'name', old?.name || '', 'text', { required: true })}
+      ${field('اسم الصنف', 'name', old?.name || '', 'text', { required: true, attrs: 'id="product-name-input" data-product-autocomplete autocomplete="off" placeholder="ابدأ بكتابة اسم الصنف لعرض الأصناف المسجلة"' })}
+      <div class="product-suggestions product-suggestions-modal" data-suggestions-for="product-name-input" hidden></div>
       ${field('رمز / باركود (SKU)', 'sku', old?.sku || '', 'text', { placeholder: 'SH-1009' })}
       ${field('التصنيف', 'category', old?.category || 'بهارات', 'text', { placeholder: 'بهارات / أعشاب / مبيدات / عسل' })}
       ${field('الوحدة الأساسية', 'base_unit', old?.base_unit || 'كيلو', 'text', { required: true, readonly: hasMovements })}
@@ -4208,14 +4537,75 @@ async function openProduct(id = null) {
       units
     };
 
-    const result = await supabase.rpc('save_product', { p_payload: payload });
-    if (result.error) { toast(result.error.message, true); return; }
-    const productId = result.data;
+    const duplicate = findDuplicateProduct(await loadProducts(), payload, payload.id || undefined);
+    if (duplicate) {
+      toast(`الصنف «${duplicate.name}» موجود مسبقاً. اختره من اقتراحات البحث أو افتح سجله للتعديل.`, true);
+      $('#product-name-input')?.focus();
+      return;
+    }
 
     const targetQty = Number(d.available_qty ?? currentQty);
+    const cachedForEdit = payload.id ? (await getCachedProducts()).find(product => String(product.id) === String(payload.id)) : null;
+    const hasPendingLocalChanges = Boolean(cachedForEdit?.local_sync_state === 'pending' || String(payload.id || '').startsWith('local-'));
+    if (isPersistentOfflineSession() || hasPendingLocalChanges) {
+      const savedLocal = await saveOfflineProduct(payload, {
+        currentQty,
+        stockTarget: targetQty,
+        unitCostBase: effectiveCost > 0 ? effectiveCost : 1,
+        notes: 'تحديث الكمية المتوفرة من نافذة تعديل الصنف'
+      });
+      if (!savedLocal.ok) { toast(savedLocal.message, true); return; }
+      cachedProducts = await getCachedProducts();
+      closeModal();
+      await renderPage();
+      await refreshOfflineBadge();
+      toast('تم حفظ بيانات الصنف محلياً. ستتم مزامنتها عند توفر اتصال صالح.');
+      if (navigator.onLine && supabase) await syncOfflineQueue(false);
+      return;
+    }
+
+    const submitButton = $('#product-form button[type=submit]');
+    if (submitButton) { submitButton.disabled = true; submitButton.textContent = 'جارٍ الحفظ…'; }
+    let result;
+    try {
+      result = await supabase.rpc('save_product', { p_payload: payload });
+    } catch (err) {
+      result = { error: err };
+    }
+    if (result.error) {
+      if (!navigator.onLine || /failed to fetch|network|fetch/i.test(result.error.message || '')) {
+        const savedLocal = await saveOfflineProduct(payload, { currentQty, stockTarget: targetQty, unitCostBase: effectiveCost > 0 ? effectiveCost : 1, notes: 'تحديث الكمية المتوفرة من نافذة تعديل الصنف' });
+        if (savedLocal.ok) {
+          offlineSessionActive = true;
+          cachedProducts = await getCachedProducts();
+          closeModal();
+          await renderPage();
+          await refreshOfflineBadge();
+          toast('انقطع الاتصال؛ حُفظ الصنف محلياً وسيتم إرساله عند عودة الإنترنت.');
+          return;
+        }
+        toast(savedLocal.message, true);
+      } else toast(result.error.message, true);
+      if (submitButton) { submitButton.disabled = false; submitButton.textContent = '💾 حفظ الصنف والكمية والوحدات'; }
+      return;
+    }
+    const productId = result.data;
     if (Math.abs(targetQty - currentQty) > 0.000001) {
       const stockRes = await applyProductStockTarget(productId, currentQty, targetQty, effectiveCost > 0 ? effectiveCost : 1, 'تحديث الكمية المتوفرة من نافذة تعديل الصنف');
       if (!stockRes.ok) {
+        if (!navigator.onLine || /failed to fetch|network|fetch|timeout|load failed/i.test(stockRes.error || '')) {
+          const queued = await queueOfflineStockTarget(productId, targetQty, currentQty, effectiveCost > 0 ? effectiveCost : 1, 'تحديث الكمية المتوفرة من نافذة تعديل الصنف');
+          if (queued.ok) {
+            offlineSessionActive = true;
+            closeModal();
+            cachedProducts = [];
+            try { cachedProducts = await loadProducts(); } catch (_e) { cachedProducts = await getCachedProducts(); }
+            await renderPage();
+            await refreshOfflineBadge();
+            toast('تم حفظ بيانات الصنف على الخادم، وحُفظ تعديل الرصيد محلياً وسيُزامن عند عودة الإنترنت.');
+            return;
+          }
+        }
         closeModal();
         cachedProducts = [];
         await renderPage();
@@ -4225,6 +4615,8 @@ async function openProduct(id = null) {
     }
     closeModal();
     cachedProducts = [];
+    await loadProducts();
+    await loadInventorySummary();
     await renderPage();
     toast('تم حفظ بيانات الصنف والكمية المتوفرة والوحدات بنجاح');
   };
@@ -4404,7 +4796,7 @@ async function viewDocument(id) {
       <button class="btn" type="button" data-action="print-invoice">🖨️ طباعة A4 رسمية / PDF</button>
       <button class="btn gold" type="button" data-action="print-thermal">🧾 طباعة حرارية 80mm (كاشير)</button>
       <button class="btn outline" type="button" data-action="export-invoice-excel">📊 تنزيل جدول Excel (CSV)</button>
-      <button class="btn whatsapp-btn" type="button" data-action="whatsapp-invoice">💬 مشاركة عبر واتساب</button>
+      <button class="btn whatsapp-btn" type="button" data-action="whatsapp-invoice">🖼️ إرسال صورة الفاتورة عبر واتساب</button>
       <button class="btn light" type="button" data-action="close-modal">إغلاق</button>
     </div>`, true);
 }
@@ -4424,13 +4816,79 @@ function invoiceShareText(data) {
   ].filter(Boolean).join('\n');
 }
 
-function shareSalesInvoice(data) {
-  const phone = data.parties?.phone || noteField(data.notes, 'هاتف العميل') || '';
-  const digits = phone.replace(/[^0-9]/g, '').replace(/^00/, '');
-  const url = digits
-    ? `https://wa.me/${digits}?text=${encodeURIComponent(invoiceShareText(data))}`
-    : `https://wa.me/?text=${encodeURIComponent(invoiceShareText(data))}`;
-  window.open(url, '_blank', 'noopener,noreferrer');
+function invoiceImageMarkup(data) {
+  const party = data.parties?.name || noteField(data.notes, 'اسم العميل') || 'عميل نقدي';
+  const phone = data.parties?.phone || noteField(data.notes, 'هاتف العميل') || '—';
+  const lines = (data.document_lines || []).map((x, i) => `
+    <tr><td>${i + 1}</td><td>${escapeHtml(x.product_name || '')}</td><td>${escapeHtml(x.unit_name || '')}</td>
+    <td>${money(x.unit_price, 4)}</td><td>${money(x.quantity, 4)}</td><td>${money(x.line_total, 4)}</td></tr>`).join('');
+  const notes = String(data.notes || '').split(/\r?\n/).filter(line => !line.startsWith('اسم العميل:') && !line.startsWith('هاتف العميل:')).join(' · ').trim();
+  return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><style>
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:#18372e;font-family:Tahoma,Arial,sans-serif;width:1000px;padding:34px}
+    .sheet{border:2px solid #d7e3dc;border-radius:22px;overflow:hidden;background:#fff}
+    .brand{background:#0d4436;color:#fff;padding:28px 34px;text-align:center;border-bottom:7px solid #c89b3c}
+    .brand h1{font-size:34px;margin:0 0 8px}.brand p{font-size:18px;margin:0;color:#e6eee9}
+    .title{display:flex;justify-content:space-between;gap:20px;background:#f0f6f2;padding:20px 30px;font-size:22px;font-weight:bold}
+    .meta{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:24px 30px}
+    .meta div{background:#f7faf8;border:1px solid #e0e9e3;border-radius:12px;padding:14px}.meta small{display:block;color:#687b72;font-size:15px;margin-bottom:7px}.meta b{font-size:19px}
+    table{width:calc(100% - 60px);margin:0 30px;border-collapse:collapse;font-size:17px}th{background:#0d4436;color:#fff;font-size:17px}th,td{padding:14px 10px;border:1px solid #dce6e0;text-align:center}td:nth-child(2){text-align:right;font-weight:bold}
+    .totals{width:430px;margin:24px 30px 24px auto;background:#f5f8f6;border-radius:14px;padding:18px 22px}.totals div{display:flex;justify-content:space-between;padding:9px 0;font-size:19px;border-bottom:1px solid #dfe8e2}.totals .grand{font-size:25px;color:#0d4436;font-weight:bold;border:0}
+    .notes{margin:0 30px 22px;padding:14px;background:#fff8e8;border-right:5px solid #c89b3c;font-size:16px}.foot{background:#f0f6f2;text-align:center;padding:20px;color:#0d4436;font-size:17px;font-weight:bold}
+  </style></head><body><main class="sheet"><header class="brand"><h1>محلات الشيباني</h1><p>للبهارات والأعشاب الطبيعية 🌿</p></header>
+  <section class="title"><span>${docTypeLabel(data.doc_type)} — ${escapeHtml(data.doc_no)}</span><span>التاريخ: ${escapeHtml(data.document_date)}</span></section>
+  <section class="meta"><div><small>العميل / الطرف</small><b>${escapeHtml(party)}</b></div><div><small>رقم الهاتف</small><b>${escapeHtml(phone)}</b></div><div><small>طريقة السداد</small><b>${data.settlement_method === 'cash' ? 'نقدي' : 'آجل'} — ${escapeHtml(data.currency)}</b></div></section>
+  ${lines ? `<table><thead><tr><th>م</th><th>الصنف</th><th>الوحدة</th><th>السعر</th><th>الكمية</th><th>الإجمالي</th></tr></thead><tbody>${lines}</tbody></table>` : `<p class="notes">${escapeHtml(notes || '—')}</p>`}
+  <section class="totals"><div><span>المجموع الفرعي</span><b>${money(data.subtotal,4)} ${escapeHtml(data.currency)}</b></div>${Number(data.discount)>0?`<div><span>الخصم</span><b>${money(data.discount,4)}</b></div>`:''}${Number(data.tax)>0?`<div><span>الضريبة</span><b>${money(data.tax,4)}</b></div>`:''}<div class="grand"><span>الصافي النهائي</span><b>${money(data.total,4)} ${escapeHtml(data.currency)}</b></div></section>
+  ${notes && lines ? `<p class="notes">ملاحظات: ${escapeHtml(notes)}</p>`:''}<footer class="foot">عدن - الشيخ عثمان - شارع طرابلس<br>شكراً لتعاملكم مع محلات الشيباني 🌿</footer></main></body></html>`;
+}
+
+async function renderInvoicePng(data) {
+  const html = invoiceImageMarkup(data);
+  const styleBlock = html.match(/<style>[\s\S]*?<\/style>/i)?.[0] || '';
+  const bodyMarkup = html.replace(/^<!doctype html><html[^>]*><head>[\s\S]*?<\/head><body>/i, '').replace(/<\/body><\/html>$/i, '');
+  const imageHeight = Math.max(1000, 850 + (data.document_lines || []).length * 58 + (data.notes ? 80 : 0));
+  const svgMarkup = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xhtml="http://www.w3.org/1999/xhtml" width="1060" height="${imageHeight}"><foreignObject x="0" y="0" width="1060" height="${imageHeight}"><xhtml:div xmlns="http://www.w3.org/1999/xhtml" style="width:1060px;height:${imageHeight}px;background:#fff">${styleBlock}${bodyMarkup}</xhtml:div></foreignObject></svg>`;
+  const svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
+  const svgUrl = URL.createObjectURL(svgBlob);
+  try {
+    const img = new Image();
+    img.decoding = 'sync';
+    await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = () => reject(new Error('تعذر تحويل الفاتورة إلى صورة على هذا المتصفح.')); img.src = svgUrl; });
+    const canvas = document.createElement('canvas');
+    canvas.width = 1060;
+    canvas.height = Math.max(1000, Math.min(5000, imageHeight));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('ميزة إنشاء الصور غير متاحة في هذا المتصفح.');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('فشل إنشاء ملف صورة الفاتورة.');
+    return blob;
+  } finally { URL.revokeObjectURL(svgUrl); }
+}
+
+async function shareSalesInvoice(data) {
+  const button = $('[data-action="whatsapp-invoice"]');
+  if (button) { button.disabled = true; button.textContent = '⏳ جارٍ تجهيز صورة الفاتورة…'; }
+  try {
+    const png = await renderInvoicePng(data);
+    const file = new File([png], `فاتورة_${String(data.doc_no || 'الشيباني').replace(/[^\w\u0600-\u06FF-]/g,'_')}.png`, { type: 'image/png' });
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: `فاتورة ${data.doc_no}`, text: `فاتورة ${data.doc_no} من محلات الشيباني` });
+      toast('تم فتح مشاركة صورة الفاتورة. اختر واتساب ثم المحادثة المطلوبة.');
+      return;
+    }
+    const imageUrl = URL.createObjectURL(png);
+    const a = document.createElement('a'); a.href = imageUrl; a.download = file.name; document.body.append(a); a.click(); a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(imageUrl), 30000);
+    toast('تم تنزيل صورة الفاتورة PNG. افتح واتساب وأرفق الصورة من التنزيلات لإرسالها.', false);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    console.error('Invoice image sharing failed:', error);
+    toast(error?.message || 'تعذر تجهيز صورة الفاتورة. جرّب متصفح Chrome محدّثاً.', true);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = '🖼️ إرسال صورة الفاتورة عبر واتساب'; }
+  }
 }
 
 function exportInvoiceToExcelCsv(data) {
@@ -4502,7 +4960,7 @@ function openDesignShowcaseModal() {
   modal('🎨 دليل التصميمات ومراجعة الوظائف والإصلاحات البرمجية', `
     <div class="stack">
       <div class="alert info">
-        <b>مراجعة واجهة ووظائف نظام الشيباني المحاسبي (الإصدار 2.0.1):</b>
+        <b>مراجعة واجهة ووظائف نظام الشيباني المحاسبي (الإصدار 2.1.0):</b>
         يعرض هذا الدليل أسلوب الواجهة والوظائف البرمجية الأساسية التي يتضمنها المشروع. يعتمد التصميم الأخضر الزمردي <code>#0D4436</code> والذهبي <code>#C89B3C</code> مع دعم الوضعين الليلي والنهاري. هذا الملخص لا يُعد اختبار استخدام ميدانياً أو اعتماداً نهائياً لدورة الترحيل المحاسبي.
       </div>
 
@@ -4679,17 +5137,17 @@ async function runItemsImport(rows) {
   let added = 0, skipped = 0, failed = 0, stockFailed = 0;
   const failureMessages = [];
   try {
-    if (!supabase?.rpc) throw new Error('اتصال قاعدة البيانات غير متاح');
+    if (!supabase?.rpc && !isPersistentOfflineSession()) throw new Error('اتصال قاعدة البيانات غير متاح');
     const existing = await loadProducts();
-    const skuSet = new Set(existing.map(x => (x.sku || '').trim().toLowerCase()).filter(Boolean));
-    const nameSet = new Set(existing.map(x => String(x.name || '').trim().toLowerCase()).filter(Boolean));
+    const skuSet = new Set(existing.map(x => normalizeProductKey(x.sku)).filter(Boolean));
+    const nameSet = new Set(existing.map(x => normalizeProductKey(x.name)).filter(Boolean));
 
     for (const d of rows) {
       const name = String(d.name || '').trim();
       const baseUnit = String(d.base_unit || '').trim();
       const sku = String(d.sku || '').trim();
-      const skuKey = sku.toLowerCase();
-      const nameKey = name.toLowerCase();
+      const skuKey = normalizeProductKey(sku);
+      const nameKey = normalizeProductKey(name);
       if (!name || !baseUnit) { failed++; continue; }
       if ((skuKey && skuSet.has(skuKey)) || nameSet.has(nameKey)) { skipped++; continue; }
       if (!['YER', 'SAR', 'USD'].includes(String(d.currency || 'YER').toUpperCase())) {
@@ -4716,36 +5174,48 @@ async function runItemsImport(rows) {
         continue;
       }
 
-      const saved = await supabase.rpc('save_product', {
-        p_payload: {
-          id: null, name, sku: sku || null, category: d.category || null, base_unit: baseUnit,
-          purchase_price: Number(d.purchase_price), sale_price: Number(d.sale_price),
-          currency: String(d.currency || 'YER').toUpperCase(),
-          avg_cost_base: Number(d.avg_cost_base || d.purchase_price),
-          reorder_level: Number(d.reorder_level), description: d.description || null, units
+      const payload = {
+        id: null, name, sku: sku || null, category: d.category || null, base_unit: baseUnit,
+        purchase_price: Number(d.purchase_price), sale_price: Number(d.sale_price),
+        currency: String(d.currency || 'YER').toUpperCase(),
+        avg_cost_base: Number(d.avg_cost_base || d.purchase_price),
+        reorder_level: Number(d.reorder_level), description: d.description || null, units
+      };
+
+      if (isPersistentOfflineSession()) {
+        const savedLocal = await saveOfflineProduct(payload, {
+          currentQty: 0, stockTarget: Number(d.opening_qty || 0),
+          unitCostBase: Number(d.avg_cost_base || d.purchase_price),
+          notes: `رصيد افتتاحي مستورد للصنف ${name}`
+        });
+        if (!savedLocal.ok) {
+          skipped++;
+          if (failureMessages.length < 3) failureMessages.push(savedLocal.message);
+          continue;
         }
-      });
-      if (saved.error || !saved.data) {
-        failed++;
-        if (failureMessages.length < 3) failureMessages.push(`تعذر حفظ «${name}»: ${saved.error?.message || 'لم يُرجع معرّف الصنف'}`);
-        continue;
+      } else {
+        const saved = await supabase.rpc('save_product', { p_payload: payload });
+        if (saved.error || !saved.data) {
+          failed++;
+          if (failureMessages.length < 3) failureMessages.push(`تعذر حفظ «${name}»: ${saved.error?.message || 'لم يُرجع معرّف الصنف'}`);
+          continue;
+        }
+        if (Number(d.opening_qty) > 0) {
+          const opening = await supabase.rpc('set_opening_stock', {
+            p_product_id: saved.data,
+            p_quantity_base: Number(d.opening_qty),
+            p_unit_cost_base: Number(d.avg_cost_base || d.purchase_price)
+          });
+          if (opening.error) {
+            stockFailed++;
+            if (failureMessages.length < 3) failureMessages.push(`أُضيف «${name}» لكن تعذّر تسجيل رصيده الافتتاحي: ${opening.error.message}`);
+          }
+        }
       }
 
       added++;
       nameSet.add(nameKey);
       if (skuKey) skuSet.add(skuKey);
-
-      if (Number(d.opening_qty) > 0) {
-        const opening = await supabase.rpc('set_opening_stock', {
-          p_product_id: saved.data,
-          p_quantity_base: Number(d.opening_qty),
-          p_unit_cost_base: Number(d.avg_cost_base || d.purchase_price)
-        });
-        if (opening.error) {
-          stockFailed++;
-          if (failureMessages.length < 3) failureMessages.push(`أُضيف «${name}» لكن تعذّر تسجيل رصيده الافتتاحي: ${opening.error.message}`);
-        }
-      }
     }
 
     cachedProducts = [];
@@ -4849,6 +5319,27 @@ function exportCurrentReportCsv() {
 /* ============================================================================
    GLOBAL EVENT DELEGATION & BOOTSTRAP
    ============================================================================ */
+async function renderProductSuggestions(input) {
+  const fieldWrap = input.closest('.field');
+  const menu = input.parentElement.querySelector(`[data-suggestions-for="${input.id}"]`)
+    || fieldWrap?.querySelector(`[data-suggestions-for="${input.id}"]`)
+    || fieldWrap?.parentElement?.querySelector(`[data-suggestions-for="${input.id}"]`);
+  if (!menu) return;
+  const query = normalizeProductKey(input.value);
+  if (!query) { menu.hidden = true; menu.innerHTML = ''; return; }
+  const products = cachedProducts.length ? cachedProducts : await loadProducts();
+  const matches = products.filter(product =>
+    normalizeProductKey(product.name).includes(query) || normalizeProductKey(product.sku).includes(query)
+  ).slice(0, 8);
+  if (!matches.length) { menu.hidden = true; menu.innerHTML = ''; return; }
+  menu.innerHTML = matches.map(product => `
+    <button type="button" class="product-suggestion-option" data-action="select-product-suggestion" data-input-id="${escapeHtml(input.id)}" data-product-id="${escapeHtml(product.id)}">
+      <b>${escapeHtml(product.name)}</b>
+      <small>${escapeHtml(product.sku || product.category || '')}${product.base_unit ? ` · ${escapeHtml(product.base_unit)}` : ''}</small>
+    </button>`).join('');
+  menu.hidden = false;
+}
+
 document.addEventListener('click', async e => {
   const pageBtn = e.target.closest('[data-page]');
   if (pageBtn) {
@@ -4864,6 +5355,23 @@ document.addEventListener('click', async e => {
       case 'toggle-menu': $('#sidebar')?.classList.toggle('open'); break;
       case 'toggle-theme': toggleTheme(); break;
       case 'start-demo': startDemoSession(b.dataset.role || 'manager'); break;
+      case 'start-offline': await startCachedOfflineSession(false); break;
+      case 'sync-now': await syncOfflineQueue(true); break;
+      case 'select-product-suggestion': {
+        const product = (cachedProducts.length ? cachedProducts : await loadProducts()).find(x => String(x.id) === String(b.dataset.productId));
+        const input = document.getElementById(b.dataset.inputId);
+        if (product && input) {
+          input.value = product.name;
+          const menu = input.parentElement.querySelector(`[data-suggestions-for="${input.id}"]`) || input.closest('.field')?.querySelector(`[data-suggestions-for="${input.id}"]`) || input.closest('.field')?.parentElement?.querySelector(`[data-suggestions-for="${input.id}"]`);
+          if (menu) menu.hidden = true;
+          if (input.id === 'sale-entry-name') {
+            const hidden = $('#sale-entry-product-id');
+            if (hidden) hidden.value = product.id;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        break;
+      }
       case 'switch-demo-role': startDemoSession(b.dataset.role || 'manager'); break;
       case 'reset-demo-data': resetDemoDB(); cachedProducts = []; cachedParties = []; cachedCash = []; await renderPage(); toast('تمت استعادة البيانات الافتراضية للنموذج'); break;
       case 'open-design-showcase': openDesignShowcaseModal(); break;
@@ -4873,7 +5381,8 @@ document.addEventListener('click', async e => {
       case 'logout':
         if (realtimeChannel && supabase?.removeChannel) await supabase.removeChannel(realtimeChannel);
         if (supabase?.auth?.signOut) await supabase.auth.signOut();
-        profile = null; session = null; isDemoMode = false;
+        try { const ref = new URL(cfg.SUPABASE_URL).hostname.split('.')[0]; localStorage.removeItem(`sb-${ref}-auth-token`); } catch (_e) {}
+        profile = null; session = null; isDemoMode = false; offlineSessionActive = false;
         cachedProducts = []; cachedParties = []; cachedCash = [];
         showLogin();
         break;
@@ -4962,6 +5471,7 @@ app.addEventListener('submit', e => {
 });
 
 app.addEventListener('input', e => {
+  if (e.target.matches('[data-product-autocomplete]')) void renderProductSuggestions(e.target);
   if (e.target.id === 'table-search') {
     const q = e.target.value.trim().toLocaleLowerCase('ar');
     $$('#data-table tbody tr').forEach(r => {
@@ -4999,10 +5509,14 @@ if (window.SHAIBANI_AUTO_DEMO) {
 } else {
   (async () => {
     try {
-      supabase = await createSupabaseLiveClient(cfg.SUPABASE_URL, supabaseApiKey, {
-        db: { schema: cfg.SUPABASE_SCHEMA || 'shaibani_erp' },
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-      });
+      supabase = await withTimeout(
+        createSupabaseLiveClient(cfg.SUPABASE_URL, supabaseApiKey, {
+          db: { schema: cfg.SUPABASE_SCHEMA || 'shaibani_erp' },
+          auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+        }),
+        25000,
+        'تأخر تحميل خدمة الاتصال. أعد المحاولة أو تحقق من اتصال الإنترنت.'
+      );
       supabase.auth.onAuthStateChange((_event, newSession) => {
         if (!newSession && profile && !isDemoMode) {
           profile = null;
@@ -5010,12 +5524,38 @@ if (window.SHAIBANI_AUTO_DEMO) {
           showLogin();
         }
       });
-      await afterLogin();
-    } catch (_err) {
-      showLogin('تعذر الاتصال المباشر بـ Supabase؛ يمكنك استخدام وضع المحاكاة التفاعلي أدناه.');
+      await withTimeout(afterLogin(), 20000, 'استغرق التحقق من الجلسة وملف الموظف وقتاً أطول من المتوقع.');
+    } catch (err) {
+      console.error('Shaibani startup failed:', err);
+      if (!(await startCachedOfflineSession(true))) {
+        showLogin('تعذر فتح النظام: ' + (err?.message || 'فشل الاتصال بالخدمة') + ' يمكنك إعادة المحاولة أو استخدام وضع النموذج التفاعلي.');
+      }
     }
   })();
 }
+
+window.addEventListener('online', async () => {
+  updateConnectionBadge('● استعادة الاتصال…');
+  if (!isDemoMode) {
+    try {
+      await ensureLiveSupabaseClient();
+      const { data: { session: restored } } = await supabase.auth.getSession();
+      if (restored) session = restored;
+      if (session && profile) await syncOfflineQueue(false);
+    } catch (err) { console.warn('تعذرت استعادة المزامنة تلقائياً:', err); }
+  }
+  await refreshOfflineBadge();
+});
+window.addEventListener('offline', async () => {
+  offlineSessionActive = !isDemoMode && Boolean(profile);
+  updateConnectionBadge();
+  if (offlineSessionActive) {
+    currentPage = 'items';
+    buildShell();
+    try { cachedProducts = await getCachedProducts(); await renderPage(); } catch (_e) {}
+  }
+  toast('انقطع الاتصال. ستبقى بيانات الأصناف المحفوظة على هذا الجهاز متاحة.');
+});
 
 if ('serviceWorker' in navigator && location.protocol === 'https:' && !window.SHAIBANI_AUTO_DEMO) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});

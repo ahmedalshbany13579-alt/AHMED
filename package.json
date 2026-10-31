@@ -1,13 +1,14 @@
 {
   "name": "shaibani-erp-web",
-  "version": "2.0.1",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
-  "description": "Static PWA for Shaibani accounting and inventory ERP",
+  "description": "Offline-first PWA for Shaibani accounting and inventory ERP",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "check": "node scripts/validate-project.mjs"
+    "check": "node scripts/validate-project.mjs",
+    "test": "node --test tests/*.test.mjs"
   }
 }
