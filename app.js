@@ -769,6 +769,113 @@ function createDemoSupabaseClient() {
     },
     rpc: async (fnName, args = {}) => {
       try {
+        if (fnName === 'manage_catalog_record_delete') {
+          if (profile?.role !== 'manager') return { data: null, error: { message: 'الحذف متاح لمدير النظام فقط' } };
+          const entity = args.p_entity;
+          const recordId = args.p_record_id;
+          let label = '';
+          let action = 'deleted';
+          db.record_management_audit ||= [];
+          if (entity === 'product') {
+            const product = db.products.find(x => String(x.id) === String(recordId));
+            if (!product) return { data: null, error: { message: 'الصنف غير موجود أو سبق حذفه' } };
+            label = product.name;
+            const hasHistory = db.stock_movements.some(x => String(x.product_id) === String(recordId)) ||
+              db.document_lines.some(x => String(x.product_id) === String(recordId));
+            if (hasHistory) return { data: null, error: { message: `لا يمكن حذف الصنف ${product.name} لأنه مرتبط بحركات مخزنية أو فواتير سابقة.` } };
+            db.products = db.products.filter(x => String(x.id) !== String(recordId));
+            db.product_units = db.product_units.filter(x => String(x.product_id) !== String(recordId));
+            db.product_catalog_events = (db.product_catalog_events || []).filter(x => String(x.product_id) !== String(recordId));
+          } else if (entity === 'party') {
+            const party = db.parties.find(x => String(x.id) === String(recordId));
+            if (!party || !['customer', 'both'].includes(party.party_type)) return { data: null, error: { message: 'العميل غير موجود أو غير صالح للحذف' } };
+            label = party.name;
+            const hasHistory = party.party_type === 'both' || Number(party.opening_balance || 0) !== 0 ||
+              (party.opening_balance_side && party.opening_balance_side !== 'none') ||
+              db.documents.some(x => String(x.party_id) === String(recordId)) ||
+              db.journal_lines.some(x => String(x.party_id) === String(recordId));
+            if (hasHistory) return { data: null, error: { message: `لا يمكن حذف العميل ${party.name} لأنه مرتبط بفواتير أو قيود أو رصيد افتتاحي.` } };
+            db.parties = db.parties.filter(x => String(x.id) !== String(recordId));
+          } else {
+            return { data: null, error: { message: 'نوع السجل غير مدعوم' } };
+          }
+          db.record_management_audit.push({ id: 'audit-' + Date.now(), entity_type: entity, record_id: recordId, record_label: label, operation: action, performed_by: profile?.id || 'demo-manager', created_at: new Date().toISOString() });
+          saveDemoDB();
+          return { data: { entity, record_id: recordId, record_label: label, action }, error: null };
+        }
+
+        if (fnName === 'void_posted_document') {
+          if (profile?.role !== 'manager') return { data: null, error: { message: 'إلغاء الفواتير متاح لمدير النظام فقط' } };
+          const doc = db.documents.find(x => String(x.id) === String(args.p_document_id));
+          if (!doc) return { data: null, error: { message: 'الفاتورة غير موجودة' } };
+          if (!['sale', 'purchase', 'sale_return', 'purchase_return'].includes(doc.doc_type)) return { data: null, error: { message: 'إلغاء السندات النقدية غير متاح من وظيفة حذف الفواتير' } };
+          if (doc.status === 'void') return { data: null, error: { message: 'هذه الفاتورة ملغاة مسبقاً' } };
+          if (doc.status !== 'posted') return { data: null, error: { message: 'لا يمكن إلغاء فاتورة غير مرحّلة' } };
+          const originalMovements = db.stock_movements.filter(x => String(x.document_id) === String(doc.id));
+          for (const movement of originalMovements) {
+            const laterMovement = db.stock_movements.some(x =>
+              String(x.product_id) === String(movement.product_id) &&
+              String(x.document_id) !== String(doc.id) &&
+              (String(x.created_at || '') > String(movement.created_at || '') ||
+                (String(x.created_at || '') === String(movement.created_at || '') && String(x.id) > String(movement.id)))
+            );
+            if (laterMovement) return { data: null, error: { message: 'لا يمكن إلغاء هذه الفاتورة لوجود حركات مخزون أحدث على أحد أصنافها.' } };
+          }
+          const requiredOut = new Map();
+          originalMovements.forEach(movement => {
+            if (Number(movement.quantity_in || 0) > 0) {
+              const key = `${movement.product_id}::${movement.warehouse_id}`;
+              requiredOut.set(key, (requiredOut.get(key) || 0) + Number(movement.quantity_in || 0));
+            }
+          });
+          for (const [key, required] of requiredOut) {
+            const [productId, warehouseId] = key.split('::');
+            const available = db.stock_movements.filter(x => String(x.product_id) === productId && String(x.warehouse_id) === warehouseId)
+              .reduce((sum, x) => sum + Number(x.quantity_in || 0) - Number(x.quantity_out || 0), 0);
+            if (available < required) return { data: null, error: { message: 'لا يمكن إلغاء الفاتورة؛ الرصيد الحالي لا يكفي لعكس حركة المخزون.' } };
+          }
+          const originalEntries = db.journal_entries.filter(x => String(x.document_id) === String(doc.id) && x.posted !== false);
+          if (!originalEntries.length) return { data: null, error: { message: 'لا يوجد قيد محاسبي مرتبط بالفاتورة' } };
+          const now = new Date().toISOString();
+          originalMovements.forEach((movement, idx) => db.stock_movements.push({
+            id: 'sm-rev-' + Date.now() + '-' + idx,
+            product_id: movement.product_id, warehouse_id: movement.warehouse_id, document_id: doc.id,
+            movement_type: Number(movement.quantity_in || 0) > 0 ? 'adjustment_out' : 'adjustment_in',
+            quantity_in: Number(movement.quantity_out || 0), quantity_out: Number(movement.quantity_in || 0),
+            unit_cost_base: Number(movement.unit_cost_base || 0), created_at: now
+          }));
+          originalEntries.forEach((entry, entryIndex) => {
+            const reverseEntryId = 'je-rev-' + Date.now() + '-' + entryIndex;
+            db.journal_entries.push({
+              id: reverseEntryId,
+              entry_no: 'REV-' + Date.now().toString().slice(-8) + '-' + entryIndex,
+              entry_date: new Date().toISOString().slice(0, 10),
+              description: 'قيد عكسي لإلغاء المستند ' + doc.doc_no,
+              document_id: doc.id, posted: true, created_at: now
+            });
+            db.journal_lines.filter(line => String(line.entry_id) === String(entry.id)).forEach((line, idx) => {
+              db.journal_lines.push({
+                ...line, id: 'jl-rev-' + Date.now() + '-' + entryIndex + '-' + idx,
+                entry_id: reverseEntryId, debit_base: Number(line.credit_base || 0),
+                credit_base: Number(line.debit_base || 0), memo: 'عكس إلغاء: ' + (line.memo || doc.doc_no)
+              });
+            });
+          });
+          const productIds = [...new Set(originalMovements.map(x => x.product_id))];
+          for (const productId of productIds) {
+            const product = db.products.find(x => String(x.id) === String(productId));
+            const movements = db.stock_movements.filter(x => String(x.product_id) === String(productId));
+            const qty = movements.reduce((sum, x) => sum + Number(x.quantity_in || 0) - Number(x.quantity_out || 0), 0);
+            const value = movements.reduce((sum, x) => sum + (Number(x.quantity_in || 0) - Number(x.quantity_out || 0)) * Number(x.unit_cost_base || 0), 0);
+            if (product) product.avg_cost_base = qty > 0 ? Number((value / qty).toFixed(6)) : 0;
+          }
+          doc.status = 'void';
+          db.record_management_audit ||= [];
+          db.record_management_audit.push({ id: 'audit-' + Date.now(), entity_type: 'document', record_id: doc.id, record_label: doc.doc_no, operation: 'voided', performed_by: profile?.id || 'demo-manager', details: { reason: args.p_reason || 'إلغاء بطلب مدير النظام' }, created_at: now });
+          saveDemoDB();
+          return { data: { document_id: doc.id, document_no: doc.doc_no, status: 'void', reversed_journal_entries: originalEntries.length }, error: null };
+        }
+
         if (fnName === 'add_product_unit_to_product') {
           const { p_product_id, p_unit_name, p_factor_to_base, p_purchase_price, p_sale_price, p_currency } = args;
           const existing = db.product_units.find(u => u.product_id === p_product_id && u.unit_name.toLowerCase() === String(p_unit_name).trim().toLowerCase());
@@ -2190,6 +2297,7 @@ async function documentsPage(type) {
       <td>${escapeHtml(x.parties?.name || noteField(x.notes, 'اسم العميل') || (type === 'sale' ? 'عميل نقدي' : '—'))}</td>
       <td><span class="badge ${x.settlement_method === 'cash' ? '' : 'gold'}">${x.settlement_method === 'cash' ? 'نقدي' : 'آجل'}</span></td>
       <td><b>${money(x.total)} ${x.currency}</b></td>
+      <td><span class="badge ${x.status === 'void' ? 'red' : 'green'}">${x.status === 'void' ? 'ملغاة' : 'مرحّلة'}</span></td>
       <td><button class="mini" type="button" data-action="view-doc" data-id="${x.id}">تفاصيل / طباعة</button></td>
     </tr>`).join('');
 
@@ -2197,7 +2305,7 @@ async function documentsPage(type) {
     <div class="section-head">
       <div>
         <h2>سجل ${type === 'sale' ? 'فواتير المبيعات ومرتجعاتها' : 'فواتير المشتريات ومرتجعاتها'}</h2>
-        <div class="hint">كل فاتورة أو مرتجع يُرحّل ذرياً إلى المخزون ودفتر القيود المزدوجة في عملية واحدة.</div>
+        <div class="hint">كل فاتورة تُرحّل مع أثرها المخزني والمحاسبي. إلغاء الفاتورة يُنشئ قيوداً وحركات عكسية ولا يمحو السجل الأصلي.</div>
       </div>
       <div class="toolbar">
         <input class="control" id="table-search" placeholder="🔍 بحث برقم الفاتورة أو اسم الطرف…">
@@ -2206,7 +2314,7 @@ async function documentsPage(type) {
           : `${btn('↩ مرتجع مشتريات', 'new-purchase-return', 'light')}${btn('＋ فاتورة مشتريات جديدة', 'new-purchase')}`}
       </div>
     </div>
-    <div id="data-table">${table(['رقم المستند', 'نوع العملية', 'التاريخ', type === 'sale' ? 'العميل' : 'المورد', 'طريقة السداد', 'الإجمالي', 'إجراء'], rows)}</div>`;
+    <div id="data-table">${table(['رقم المستند', 'نوع العملية', 'التاريخ', type === 'sale' ? 'العميل' : 'المورد', 'طريقة السداد', 'الإجمالي', 'الحالة', 'إجراء'], rows)}</div>`;
 }
 
 /* ============================================================================
@@ -2236,6 +2344,7 @@ async function itemsPage() {
         <td class="actions">
           <button class="mini" type="button" data-action="view-stock-card" data-id="${escapeHtml(x.id)}">كارت الصنف</button>
           ${canFinance() ? `<button class="mini gold" type="button" data-action="edit-product" data-id="${escapeHtml(x.id)}">تعديل</button>` : ''}
+          ${canManage() ? `<button class="mini red" type="button" data-action="delete-catalog-record" data-entity="product" data-id="${escapeHtml(x.id)}">حذف</button>` : ''}
         </td>
       </tr>`;
   }).join('');
@@ -2269,6 +2378,7 @@ async function itemsPage() {
           ${canFinance() ? `<button class="mini" type="button" data-action="open-stock-qty-modal" data-id="${escapeHtml(x.id)}">📦 الكمية</button>` : ''}
           <button class="mini" type="button" data-action="view-stock-card" data-id="${escapeHtml(x.id)}">▤ حركة الصنف</button>
           ${canFinance() ? `<button class="mini gold" type="button" data-action="edit-product" data-id="${escapeHtml(x.id)}">✎ تعديل</button>` : ''}
+          ${canManage() ? `<button class="mini red" type="button" data-action="delete-catalog-record" data-entity="product" data-id="${escapeHtml(x.id)}">🗑️ حذف</button>` : ''}
         </div>
       </article>`;
   }).join('');
@@ -2406,6 +2516,7 @@ async function partiesPage(kind) {
           <td class="actions">
             <button class="mini" type="button" data-action="view-party-statement" data-id="${x.id}">📄 كشف حساب</button>
             <button class="mini gold" type="button" data-action="edit-party" data-kind="${kind}" data-id="${x.id}">تعديل</button>
+            ${canManage() && kind === 'customer' ? `<button class="mini red" type="button" data-action="delete-catalog-record" data-entity="party" data-id="${x.id}">حذف العميل</button>` : ''}
           </td>
         ` : ''}
       </tr>`;
@@ -4771,7 +4882,7 @@ async function viewDocument(id) {
         <img src="${BANNER_SRC}" alt="ترويسة محلات الشيباني" class="invoice-official-banner-img">
         <div class="invoice-official-title-bar">
           <span>${docTypeLabel(data.doc_type)} — رقم: ${escapeHtml(data.doc_no)}</span>
-          <span>تاريخ الفاتورة: ${escapeHtml(data.document_date)}</span>
+          <span>تاريخ الفاتورة: ${escapeHtml(data.document_date)}${data.status === 'void' ? ' · ملغاة' : ' · مرحّلة'}</span>
         </div>
       </div>
       <div class="saved-invoice-meta">
@@ -4793,12 +4904,52 @@ async function viewDocument(id) {
       <div class="saved-invoice-footer">محلات الشيباني للبهارات والأعشاب الطبيعية — عدن - الشيخ عثمان - شارع طرابلس 🌿</div>
     </div>
     <div class="saved-invoice-actions">
+      ${data.status === 'void' ? `<div class="alert error full">هذه الفاتورة ملغاة. السجل محفوظ للرجوع إليه وقد عُكست قيودها وحركاتها المخزنية.</div>` : ''}
       <button class="btn" type="button" data-action="print-invoice">🖨️ طباعة A4 رسمية / PDF</button>
       <button class="btn gold" type="button" data-action="print-thermal">🧾 طباعة حرارية 80mm (كاشير)</button>
       <button class="btn outline" type="button" data-action="export-invoice-excel">📊 تنزيل جدول Excel (CSV)</button>
       <button class="btn whatsapp-btn" type="button" data-action="whatsapp-invoice">🖼️ إرسال صورة الفاتورة عبر واتساب</button>
+      ${canManage() && ['sale', 'purchase', 'sale_return', 'purchase_return'].includes(data.doc_type) && data.status !== 'void' ? `<button class="btn danger" type="button" data-action="void-document" data-id="${escapeHtml(data.id)}">🗑️ إلغاء الفاتورة وعكس أثرها</button>` : ''}
       <button class="btn light" type="button" data-action="close-modal">إغلاق</button>
     </div>`, true);
+}
+
+async function deleteCatalogRecord(entity, recordId) {
+  if (!canManage()) { toast('هذه العملية متاحة لمدير النظام فقط', true); return; }
+  if (isPersistentOfflineSession()) { toast('يلزم الاتصال بقاعدة البيانات لتنفيذ الحذف بأمان.', true); return; }
+  const entityLabel = entity === 'product' ? 'الصنف' : 'العميل';
+  const confirmText = entity === 'product'
+    ? 'هل تريد حذف هذا الصنف نهائياً؟ إذا كان مرتبطاً بفواتير أو حركات مخزنية فسيمنع النظام الحذف لحماية المخزون والتاريخ.'
+    : 'هل تريد حذف هذا العميل نهائياً؟ إذا كان مرتبطاً بفواتير أو أرصدة محاسبية فسيمنع النظام الحذف لحماية كشف الحساب.';
+  if (!window.confirm(confirmText)) return;
+  const { data, error } = await supabase.rpc('manage_catalog_record_delete', {
+    p_entity: entity,
+    p_record_id: recordId
+  });
+  if (error) throw error;
+  cachedProducts = [];
+  cachedParties = [];
+  await renderPage();
+  const label = data?.record_label || entityLabel;
+  toast(`تم حذف ${entityLabel} «${label}» نهائياً.`);
+}
+
+async function voidPostedDocument(documentId) {
+  if (!canManage()) { toast('إلغاء الفواتير متاح لمدير النظام فقط', true); return; }
+  if (isPersistentOfflineSession()) { toast('يلزم الاتصال بقاعدة البيانات لإلغاء الفاتورة وعكس آثارها المحاسبية والمخزنية.', true); return; }
+  const confirmed = window.confirm('تأكيد إلغاء هذه الفاتورة؟ سيُنشئ النظام قيداً محاسبياً عكسياً وحركات مخزون عكسية، ولن يحذف المستند الأصلي. لا يمكن التراجع عن الإلغاء من هذه النافذة.');
+  if (!confirmed) return;
+  const { data, error } = await supabase.rpc('void_posted_document', {
+    p_document_id: documentId,
+    p_reason: 'إلغاء بطلب مدير النظام من شاشة تفاصيل الفاتورة'
+  });
+  if (error) throw error;
+  activeInvoiceForActions = null;
+  closeModal();
+  cachedProducts = [];
+  cachedParties = [];
+  await renderPage();
+  toast(`تم إلغاء الفاتورة ${data?.document_no || ''} وعكس أثرها المحاسبي والمخزني بنجاح.`);
 }
 
 function invoiceShareText(data) {
@@ -5453,6 +5604,8 @@ document.addEventListener('click', async e => {
       case 'invite-user': inviteUser(); break;
       case 'edit-user': await editUser(b.dataset.id); break;
       case 'view-doc': await viewDocument(b.dataset.id); break;
+      case 'delete-catalog-record': await deleteCatalogRecord(b.dataset.entity, b.dataset.id); break;
+      case 'void-document': await voidPostedDocument(b.dataset.id); break;
       case 'view-journal': await viewJournal(b.dataset.id); break;
       case 'new-manual-journal': await openManualJournal(); break;
       case 'view-account-ledger': await openAccountLedger(b.dataset.id); break;

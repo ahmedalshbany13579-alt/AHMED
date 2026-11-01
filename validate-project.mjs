@@ -30,6 +30,8 @@ try {
   const offlineStore = read('offline-store.js');
   const duplicateGuard = read('supabase/patches/07_product_duplicate_guard.sql');
   const duplicateReport = read('supabase/verification/product_duplicate_check.sql');
+  const deletionPatch = read('supabase/patches/08_safe_record_deletion_and_invoice_voiding.sql');
+  const deletionReport = read('supabase/verification/deletion_feature_check.sql');
 
   for (const match of index.matchAll(/(?:src|href)="(\/(?:[^"?#]+))"/g)) {
     const asset = match[1].replace(/^\//, '');
@@ -74,7 +76,7 @@ try {
   assert(css.includes('.items-mobile-list {') && css.includes('display: none;') && css.includes('display: block;'), 'تعريف عرض متجاوب منفصل للجدول وبطاقات الهاتف');
   assert(css.includes('@media (max-width: 760px)') && css.includes('@media (max-width: 360px)'), 'إضافة نقاط توقف لشاشات الهاتف الصغيرة');
   assert(app.includes('data-action=\"new-product\"') && app.includes('data-action=\"import-items\"') && app.includes('data-action=\"new-stock-adjustment\"'), 'الإبقاء على إجراءات إضافة واستيراد وتسوية الأصناف');
-  assert(sw.includes('shaibani-shell-v13-startup-recovery'), 'تحديث ذاكرة PWA لنسخة مشاركة صورة الفاتورة');
+  assert(sw.includes('shaibani-shell-v14-safe-delete-void'), 'تحديث ذاكرة PWA لنسخة الحذف الآمن وإلغاء الفواتير');
   assert(sw.includes("'/offline-store.js'") && existsSync(join(root, 'offline-store.js')), 'تخزين طبقة IndexedDB محلياً ضمن ملفات PWA');
   assert(app.includes("from './offline-store.js'") && app.includes('saveOfflineProduct'), 'ربط التطبيق بمخزن IndexedDB وحفظ الأصناف محلياً');
   assert(offlineStore.includes("createObjectStore('products'") && offlineStore.includes("createObjectStore('outbox'"), 'وجود مخازن الأصناف وطابور المزامنة المحلي');
@@ -95,6 +97,18 @@ try {
   assert(duplicateGuard.includes('normalize_product_identity') && duplicateGuard.includes('translate('), 'تطبيع الهمزات والتشكيل والتطويل في منع التكرار على الخادم');
   assert(duplicateGuard.includes('if not coalesce(new.active, true) then'), 'السماح بتعطيل صنف قديم مكرر أثناء تنظيف البيانات');
   assert(duplicateReport.includes('having count(*) > 1') && duplicateReport.includes('translate('), 'استعلام مستقل لكشف التكرارات العربية قبل تفعيل الحارس');
+  assert(deletionPatch.includes('function shaibani_internal.manage_catalog_record_delete') && deletionPatch.includes("v_role is distinct from 'manager'"), 'إجراء حذف الأصناف والعملاء محمي بدور المدير داخل مخطط داخلي');
+  assert(deletionPatch.includes('function shaibani_erp.manage_catalog_record_delete') && deletionPatch.includes('security invoker'), 'واجهة RPC المكشوفة تفوض إلى دالة داخلية بصلاحيات المستدعي');
+  assert(deletionPatch.includes('function shaibani_internal.void_posted_document') && deletionPatch.includes("set status = 'void'"), 'إلغاء الفواتير يحدّث الحالة مع الاحتفاظ بالمستند الأصلي');
+  assert(deletionPatch.includes('journal_lines') && deletionPatch.includes('quantity_in') && deletionPatch.includes('quantity_out'), 'الإلغاء يعكس القيود المحاسبية وحركات المخزون');
+  assert(deletionPatch.includes('(later_move.created_at, later_move.id) > (original_move.created_at, original_move.id)') && !deletionPatch.includes('later_move.warehouse_id = original_move.warehouse_id'), 'منع إلغاء حركة أقدم للصنف في أي مستودع لحماية متوسط التكلفة العام');
+  assert(deletionPatch.includes('record_management_audit') && deletionPatch.includes('enable row level security'), 'تسجيل إجراءات الحذف والإلغاء بجدول تدقيق محمي');
+  assert(deletionPatch.includes('revoke delete on table shaibani_erp.products') && deletionPatch.includes('shaibani_erp.documents'), 'منع الحذف المباشر من الجداول الحساسة');
+  assert(deletionReport.includes('anon_can_execute') && deletionReport.includes('authenticated_can_execute') && deletionReport.includes('audit_rls_enabled'), 'توفير استعلام تحقق مستقل لصلاحيات دوال الحذف والتدقيق');
+  assert(deletionPatch.includes('لا تضف shaibani_internal إلى قائمة Exposed schemas'), 'التنبيه إلى إبقاء مخطط الإجراءات الداخلية خارج Supabase Data API');
+  assert(app.includes("supabase.rpc('manage_catalog_record_delete'") && app.includes("supabase.rpc('void_posted_document'"), 'ربط إجراءات الحذف والإلغاء بواجهات Supabase RPC');
+  assert(app.includes('data-action=\"delete-catalog-record\"') && app.includes('data-action=\"void-document\"'), 'إظهار أزرار حذف الأصناف والعملاء وإلغاء الفواتير');
+  assert(app.includes("x.status === 'void' ? 'ملغاة' : 'مرحّلة'"), 'إظهار حالة الفاتورة الملغاة في سجل الفواتير');
   assert(app.includes("window.addEventListener('online'") && app.includes("window.addEventListener('offline'"), 'مراقبة الاتصال وتشغيل المزامنة التلقائية');
   assert(existsSync(join(root, 'README_OFFLINE_FIRST_AR.md')), 'توفير دليل عربي لتشغيل وضع عدم الاتصال');
   assert(app.includes('async function renderInvoicePng(data)') && app.includes('image/png'), 'توليد صورة PNG فعلية للفاتورة');
