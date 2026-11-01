@@ -1,6 +1,6 @@
 {
   "name": "shaibani-erp-web",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "private": true,
   "type": "module",
   "description": "Offline-first PWA for Shaibani accounting and inventory ERP",

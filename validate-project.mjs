@@ -76,7 +76,7 @@ try {
   assert(css.includes('.items-mobile-list {') && css.includes('display: none;') && css.includes('display: block;'), 'تعريف عرض متجاوب منفصل للجدول وبطاقات الهاتف');
   assert(css.includes('@media (max-width: 760px)') && css.includes('@media (max-width: 360px)'), 'إضافة نقاط توقف لشاشات الهاتف الصغيرة');
   assert(app.includes('data-action=\"new-product\"') && app.includes('data-action=\"import-items\"') && app.includes('data-action=\"new-stock-adjustment\"'), 'الإبقاء على إجراءات إضافة واستيراد وتسوية الأصناف');
-  assert(sw.includes('shaibani-shell-v14-safe-delete-void'), 'تحديث ذاكرة PWA لنسخة الحذف الآمن وإلغاء الفواتير');
+  assert(sw.includes('shaibani-shell-v15-invoice-branding'), 'تحديث ذاكرة PWA لهوية الفواتير الجديدة');
   assert(sw.includes("'/offline-store.js'") && existsSync(join(root, 'offline-store.js')), 'تخزين طبقة IndexedDB محلياً ضمن ملفات PWA');
   assert(app.includes("from './offline-store.js'") && app.includes('saveOfflineProduct'), 'ربط التطبيق بمخزن IndexedDB وحفظ الأصناف محلياً');
   assert(offlineStore.includes("createObjectStore('products'") && offlineStore.includes("createObjectStore('outbox'"), 'وجود مخازن الأصناف وطابور المزامنة المحلي');
@@ -112,6 +112,9 @@ try {
   assert(app.includes("window.addEventListener('online'") && app.includes("window.addEventListener('offline'"), 'مراقبة الاتصال وتشغيل المزامنة التلقائية');
   assert(existsSync(join(root, 'README_OFFLINE_FIRST_AR.md')), 'توفير دليل عربي لتشغيل وضع عدم الاتصال');
   assert(app.includes('async function renderInvoicePng(data)') && app.includes('image/png'), 'توليد صورة PNG فعلية للفاتورة');
+  assert(app.includes("'/icons/shaibani-invoice-header.jpg'") && sw.includes("'/icons/shaibani-invoice-header.jpg'"), 'استخدام ترويسة الشيباني الرسمية وتخزينها للعمل دون اتصال');
+  assert(app.includes('async function loadInvoiceHeaderDataUri()') && app.includes('invoiceImageMarkup(data, brandImageDataUri)'), 'تضمين صورة هوية الشيباني داخل صورة الفاتورة المُصدّرة');
+  assert(app.includes('WhatsApp: 773837930 · 772533727') && app.includes('Tel: 02 383280'), 'إظهار رقمي واتساب والهاتف الأرضي في الفاتورة المُصدّرة');
   assert(app.includes('navigator.canShare({ files: [file] })') && app.includes('navigator.share({ files: [file]'), 'مشاركة ملف صورة الفاتورة عبر واجهة المشاركة الأصلية للهاتف');
   assert(app.includes('a.download = file.name') && app.includes('افتح واتساب وأرفق الصورة'), 'تنزيل صورة الفاتورة كبديل عند عدم دعم مشاركة الملفات');
   assert(app.includes('إرسال صورة الفاتورة عبر واتساب') && !app.includes('https://wa.me/${digits}?text=${encodeURIComponent(invoiceShareText(data))}'), 'استبدال إرسال نص الفاتورة بمسار مشاركة الصورة');

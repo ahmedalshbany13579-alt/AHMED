@@ -34,7 +34,7 @@ const supabaseApiKey = cfg.SUPABASE_PUBLISHABLE_KEY || cfg.SUPABASE_ANON_KEY || 
 const configured = /^https:\/\/.+\.supabase\.co$/.test(cfg.SUPABASE_URL || '') &&
   supabaseApiKey && !String(supabaseApiKey).includes('YOUR_');
 const LOGO_SRC = window.SHAIBANI_LOGO_DATA_URI || '/icons/shaibani-logo.jpg';
-const BANNER_SRC = window.SHAIBANI_BANNER_DATA_URI || '/icons/shaibani-banner.svg';
+const BANNER_SRC = window.SHAIBANI_BANNER_DATA_URI || '/icons/shaibani-invoice-header.jpg';
 
 const app = document.getElementById('app');
 function markAppReady() {
@@ -4967,37 +4967,60 @@ function invoiceShareText(data) {
   ].filter(Boolean).join('\n');
 }
 
-function invoiceImageMarkup(data) {
+function invoiceImageMarkup(data, brandImageDataUri = '') {
   const party = data.parties?.name || noteField(data.notes, 'اسم العميل') || 'عميل نقدي';
   const phone = data.parties?.phone || noteField(data.notes, 'هاتف العميل') || '—';
   const lines = (data.document_lines || []).map((x, i) => `
     <tr><td>${i + 1}</td><td>${escapeHtml(x.product_name || '')}</td><td>${escapeHtml(x.unit_name || '')}</td>
     <td>${money(x.unit_price, 4)}</td><td>${money(x.quantity, 4)}</td><td>${money(x.line_total, 4)}</td></tr>`).join('');
   const notes = String(data.notes || '').split(/\r?\n/).filter(line => !line.startsWith('اسم العميل:') && !line.startsWith('هاتف العميل:')).join(' · ').trim();
+  const brandHeader = brandImageDataUri
+    ? `<img class="brand-img" src="${brandImageDataUri}" alt="محلات الشيباني للبهارات والأعشاب الطبيعية">`
+    : `<div class="brand-fallback"><h1>محلات الشيباني</h1><p>للبهارات والأعشاب الطبيعية</p><p>اليمن — عدن — الشيخ عثمان — شارع طرابلس</p><p dir="ltr">WhatsApp: 773837930 · 772533727 | Tel: 02 383280</p></div>`;
   return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><style>
-    *{box-sizing:border-box}body{margin:0;background:#fff;color:#18372e;font-family:Tahoma,Arial,sans-serif;width:1000px;padding:34px}
-    .sheet{border:2px solid #d7e3dc;border-radius:22px;overflow:hidden;background:#fff}
-    .brand{background:#0d4436;color:#fff;padding:28px 34px;text-align:center;border-bottom:7px solid #c89b3c}
-    .brand h1{font-size:34px;margin:0 0 8px}.brand p{font-size:18px;margin:0;color:#e6eee9}
-    .title{display:flex;justify-content:space-between;gap:20px;background:#f0f6f2;padding:20px 30px;font-size:22px;font-weight:bold}
-    .meta{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:24px 30px}
-    .meta div{background:#f7faf8;border:1px solid #e0e9e3;border-radius:12px;padding:14px}.meta small{display:block;color:#687b72;font-size:15px;margin-bottom:7px}.meta b{font-size:19px}
-    table{width:calc(100% - 60px);margin:0 30px;border-collapse:collapse;font-size:17px}th{background:#0d4436;color:#fff;font-size:17px}th,td{padding:14px 10px;border:1px solid #dce6e0;text-align:center}td:nth-child(2){text-align:right;font-weight:bold}
-    .totals{width:430px;margin:24px 30px 24px auto;background:#f5f8f6;border-radius:14px;padding:18px 22px}.totals div{display:flex;justify-content:space-between;padding:9px 0;font-size:19px;border-bottom:1px solid #dfe8e2}.totals .grand{font-size:25px;color:#0d4436;font-weight:bold;border:0}
-    .notes{margin:0 30px 22px;padding:14px;background:#fff8e8;border-right:5px solid #c89b3c;font-size:16px}.foot{background:#f0f6f2;text-align:center;padding:20px;color:#0d4436;font-size:17px;font-weight:bold}
-  </style></head><body><main class="sheet"><header class="brand"><h1>محلات الشيباني</h1><p>للبهارات والأعشاب الطبيعية 🌿</p></header>
+    *{box-sizing:border-box}body{margin:0;background:#fff;color:#18372e;font-family:Tahoma,Arial,sans-serif;width:1000px;padding:30px}
+    .sheet{border:2px solid #d7e3dc;border-radius:20px;overflow:hidden;background:#fff}
+    .brand{background:#fff;padding:8px 12px;border-bottom:5px solid #c89b3c;text-align:center}.brand-img{display:block;width:100%;height:auto;max-height:250px;object-fit:contain;margin:0 auto}
+    .brand-fallback{background:#0d4436;color:#fff;padding:24px}.brand-fallback h1{font-size:34px;margin:0 0 8px}.brand-fallback p{font-size:17px;margin:6px 0;color:#f5e8c5}
+    .title{display:flex;justify-content:space-between;gap:20px;background:#f0f6f2;padding:18px 28px;font-size:21px;font-weight:bold}
+    .meta{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:20px 28px}
+    .meta div{background:#f7faf8;border:1px solid #e0e9e3;border-radius:12px;padding:13px}.meta small{display:block;color:#687b72;font-size:14px;margin-bottom:7px}.meta b{font-size:18px}
+    table{width:calc(100% - 56px);margin:0 28px;border-collapse:collapse;font-size:16px}th{background:#0d4436;color:#fff;font-size:16px}th,td{padding:12px 9px;border:1px solid #dce6e0;text-align:center}td:nth-child(2){text-align:right;font-weight:bold}
+    .totals{width:430px;margin:22px 28px 22px auto;background:#f5f8f6;border-radius:14px;padding:16px 20px}.totals div{display:flex;justify-content:space-between;padding:8px 0;font-size:18px;border-bottom:1px solid #dfe8e2}.totals .grand{font-size:24px;color:#0d4436;font-weight:bold;border:0}
+    .notes{margin:0 28px 20px;padding:13px;background:#fff8e8;border-right:5px solid #c89b3c;font-size:15px}.foot{background:#f0f6f2;text-align:center;padding:18px;color:#0d4436;font-size:16px;font-weight:bold;line-height:1.8}
+  </style></head><body><main class="sheet"><header class="brand">${brandHeader}</header>
   <section class="title"><span>${docTypeLabel(data.doc_type)} — ${escapeHtml(data.doc_no)}</span><span>التاريخ: ${escapeHtml(data.document_date)}</span></section>
   <section class="meta"><div><small>العميل / الطرف</small><b>${escapeHtml(party)}</b></div><div><small>رقم الهاتف</small><b>${escapeHtml(phone)}</b></div><div><small>طريقة السداد</small><b>${data.settlement_method === 'cash' ? 'نقدي' : 'آجل'} — ${escapeHtml(data.currency)}</b></div></section>
   ${lines ? `<table><thead><tr><th>م</th><th>الصنف</th><th>الوحدة</th><th>السعر</th><th>الكمية</th><th>الإجمالي</th></tr></thead><tbody>${lines}</tbody></table>` : `<p class="notes">${escapeHtml(notes || '—')}</p>`}
   <section class="totals"><div><span>المجموع الفرعي</span><b>${money(data.subtotal,4)} ${escapeHtml(data.currency)}</b></div>${Number(data.discount)>0?`<div><span>الخصم</span><b>${money(data.discount,4)}</b></div>`:''}${Number(data.tax)>0?`<div><span>الضريبة</span><b>${money(data.tax,4)}</b></div>`:''}<div class="grand"><span>الصافي النهائي</span><b>${money(data.total,4)} ${escapeHtml(data.currency)}</b></div></section>
-  ${notes && lines ? `<p class="notes">ملاحظات: ${escapeHtml(notes)}</p>`:''}<footer class="foot">عدن - الشيخ عثمان - شارع طرابلس<br>شكراً لتعاملكم مع محلات الشيباني 🌿</footer></main></body></html>`;
+  ${notes && lines ? `<p class="notes">ملاحظات: ${escapeHtml(notes)}</p>`:''}<footer class="foot">اليمن — عدن — الشيخ عثمان — شارع طرابلس<br><span dir="ltr">واتساب: 773837930 · 772533727 | هاتف: 02 383280</span><br>شكراً لتعاملكم مع محلات الشيباني 🌿</footer></main></body></html>`;
+}
+
+async function loadInvoiceHeaderDataUri() {
+  try {
+    const response = await fetch(BANNER_SRC, { cache: 'force-cache' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return `data:${blob.type || 'image/jpeg'};base64,${btoa(binary)}`;
+  } catch (error) {
+    console.warn('تعذر تحميل صورة ترويسة الفاتورة؛ سيستخدم رأس نصي احتياطي:', error);
+    return '';
+  }
 }
 
 async function renderInvoicePng(data) {
-  const html = invoiceImageMarkup(data);
+  const brandImageDataUri = await loadInvoiceHeaderDataUri();
+  const html = invoiceImageMarkup(data, brandImageDataUri);
   const styleBlock = html.match(/<style>[\s\S]*?<\/style>/i)?.[0] || '';
   const bodyMarkup = html.replace(/^<!doctype html><html[^>]*><head>[\s\S]*?<\/head><body>/i, '').replace(/<\/body><\/html>$/i, '');
-  const imageHeight = Math.max(1000, 850 + (data.document_lines || []).length * 58 + (data.notes ? 80 : 0));
+  const imageHeight = Math.max(1100, 1040 + (data.document_lines || []).length * 58 + (data.notes ? 90 : 0));
   const svgMarkup = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xhtml="http://www.w3.org/1999/xhtml" width="1060" height="${imageHeight}"><foreignObject x="0" y="0" width="1060" height="${imageHeight}"><xhtml:div xmlns="http://www.w3.org/1999/xhtml" style="width:1060px;height:${imageHeight}px;background:#fff">${styleBlock}${bodyMarkup}</xhtml:div></foreignObject></svg>`;
   const svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
   const svgUrl = URL.createObjectURL(svgBlob);
@@ -5007,7 +5030,7 @@ async function renderInvoicePng(data) {
     await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = () => reject(new Error('تعذر تحويل الفاتورة إلى صورة على هذا المتصفح.')); img.src = svgUrl; });
     const canvas = document.createElement('canvas');
     canvas.width = 1060;
-    canvas.height = Math.max(1000, Math.min(5000, imageHeight));
+    canvas.height = Math.max(1100, Math.min(6000, imageHeight));
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('ميزة إنشاء الصور غير متاحة في هذا المتصفح.');
     ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -5080,9 +5103,12 @@ function printSalesInvoice(data, thermal = false) {
     ? `body{font-family:Tahoma,Arial,sans-serif;width:76mm;margin:0 auto;padding:8px;color:#000;font-size:11px}header{text-align:center;border-bottom:1.5px dashed #000;padding-bottom:8px}h1{font-size:15px;margin:4px 0}.logo{width:52px;height:52px;border-radius:50%;object-fit:cover}.meta{margin:8px 0;font-size:10.5px;line-height:1.5}table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:4px 2px;border-bottom:1px dashed #999;text-align:right}.totals{margin-top:8px;border-top:1.5px dashed #000;padding-top:6px}.totals div{display:flex;justify-content:space-between;margin:3px 0}.grand{font-weight:bold;font-size:13px}.footer{text-align:center;margin-top:10px;font-size:10px}`
     : `body{font-family:Tahoma,Arial,sans-serif;color:#1b2d26;padding:28px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid #c89b3c;padding-bottom:16px}h1{color:#0d4436;font-size:23px;margin:0 0 4px}.logo{width:78px;height:78px;object-fit:cover;border-radius:50%;border:2px solid #c89b3c}.meta{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0;padding:12px;background:#f4f7f5;border-radius:10px}.meta span{display:block;color:#667870;font-size:11px;margin-bottom:4px}table{width:100%;border-collapse:collapse;margin-top:16px}th{background:#0d4436;color:#fff}th,td{padding:10px;border:1px solid #dce6e0;text-align:right}.totals{width:320px;margin:18px 0 0 auto}.totals div{display:flex;justify-content:space-between;padding:7px;border-bottom:1px solid #e5ebe7}.grand{background:#eaf5f0;color:#0d4436;font-weight:bold;font-size:17px}.footer{text-align:center;margin-top:32px;color:#0d4436;font-size:12px}`;
 
+  const printBrandHeader = thermal
+    ? `<div style="text-align:center;padding-bottom:8px;border-bottom:1.5px dashed #000"><img src="${LOGO_SRC}" class="logo" alt="شعار الشيباني"><h1>محلات الشيباني</h1><b>للبهارات والأعشاب الطبيعية</b><div>عدن — الشيخ عثمان — شارع طرابلس</div><div dir="ltr">WhatsApp: 773837930 · 772533727</div><div dir="ltr">Tel: 02 383280</div></div>`
+    : `<img src="${BANNER_SRC}" alt="محلات الشيباني للبهارات والأعشاب الطبيعية" style="width:100%;height:auto;max-height:190px;object-fit:contain;display:block;margin:0 auto 8px">`;
   w.document.write(`<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>${escapeHtml(data.doc_no)}</title><style>${styleCss}</style></head><body>
     <header style="display:block;text-align:center;border-bottom:3px solid #c89b3c;padding-bottom:12px">
-      <img src="${BANNER_SRC}" style="width:100%;max-height:130px;object-fit:contain;display:block;margin:0 auto 8px">
+      ${printBrandHeader}
       <div style="display:flex;justify-content:space-between;align-items:center;background:#0d4436;color:#fff;padding:8px 14px;border-radius:8px"><b>${docTypeLabel(data.doc_type)} (${escapeHtml(data.doc_no)})</b><span>التاريخ: ${escapeHtml(data.document_date)}</span></div>
     </header>
     <div class="meta">
@@ -5098,7 +5124,7 @@ function printSalesInvoice(data, thermal = false) {
       ${Number(data.tax) > 0 ? `<div><span>الضريبة</span><b>${money(data.tax, 4)}</b></div>` : ''}
       <div class="grand"><span>الصافي النهائي</span><b>${money(data.total, 4)} ${escapeHtml(data.currency)}</b></div>
     </div>
-    <div class="footer">اليمن - عدن - الشيخ عثمان - شارع طرابلس · واتساب: 773837930<br>شكراً لتعاملكم مع محلات الشيباني 🌿</div>
+    <div class="footer">اليمن — عدن — الشيخ عثمان — شارع طرابلس<br>واتساب: 773837930 · 772533727 | هاتف: 02 383280<br>شكراً لتعاملكم مع محلات الشيباني 🌿</div>
     <script>window.onload=()=>setTimeout(()=>window.print(),300);<\/script>
   </body></html>`);
   w.document.close();
